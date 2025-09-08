@@ -5,6 +5,8 @@
 import fs from "fs";
 import puppeteer from "puppeteer";
 import path from "path";
+import dotenv from "dotenv";
+dotenv.config();
 
 const USER_DATA_DIR = "./chrome-profile";
 /* ====== CONFIG (điền đúng) ====== */
@@ -97,6 +99,43 @@ async function gentleReveal(page) {
   }
   await page.evaluate(() => window.scrollTo(0, 0));
 }
+
+async function loginWithCredentialsAndSave(page, email, password) {
+  console.log("⚠️ Cookie login không thành công → thử login bằng email/mật khẩu...");
+
+  await page.goto("https://www.netflix.com/login", { waitUntil: "networkidle2", timeout: 60000 });
+
+  const emailInput = await page.$('input[name="userLoginId"]');
+  const passInput = await page.$('input[name="password"]');
+  const submitBtn = await page.$('button[type="submit"]');
+
+  if (!emailInput || !passInput || !submitBtn) {
+    console.log("❌ Không tìm thấy ô nhập email/mật khẩu.");
+    return false;
+  }
+
+  await emailInput.type(email, { delay: 50 });
+  await passInput.type(password, { delay: 50 });
+  await submitBtn.click();
+
+  try {
+    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10000 });
+  } catch {}
+
+  // Kiểm tra login thành công hay không
+  const url = page.url();
+  if (!url.includes("/browse") && !url.includes("/profiles")) {
+    console.log("❌ Login thất bại (kiểm tra email/password).");
+    return false;
+  }
+
+  const cookies = await page.cookies();
+  fs.writeFileSync("cookies.json", JSON.stringify({ url: "https://www.netflix.com", cookies }, null, 2), "utf-8");
+  console.log("✅ Đăng nhập thành công & đã lưu cookies.json");
+
+  return true;
+}
+
 
 /* ============== Quét & mở hồ sơ theo tên ============== */
 async function getProfileNames(page) {
@@ -721,8 +760,39 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
 
     // cookie login
     await page.goto("https://www.netflix.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
-    try { const cur = await page.cookies(); if (cur.length) await page.deleteCookie(...cur); } catch {}
-    for (const ck of cookies) { try { await page.setCookie(ck); } catch (e) { console.log("❌ cookie:", ck.name, e?.message || e); } }
+
+// clear cookie
+try {
+  const cur = await page.cookies();
+  if (cur.length) await page.deleteCookie(...cur);
+} catch {}
+
+// set cookie từ file
+for (const ck of cookies) {
+  try { await page.setCookie(ck); } catch (e) { console.log("❌ cookie:", ck.name, e?.message || e); }
+}
+
+// kiểm tra cookie login có dùng được không
+await page.goto("https://www.netflix.com/browse", { waitUntil: "networkidle2", timeout: 60000 });
+const loginCheck = await page.evaluate(() => {
+  return !(document.querySelector('form[action="/login"]') || location.pathname.includes("/login"));
+});
+
+if (!loginCheck) {
+  const email = process.env.NETFLIX_EMAIL;
+  const password = process.env.NETFLIX_PASSWORD;
+  if (!email || !password) {
+    console.log("❌ Thiếu biến môi trường NETFLIX_EMAIL hoặc NETFLIX_PASSWORD");
+    await cleanup(1);
+    return;
+  }
+
+  const loginOk = await loginWithCredentialsAndSave(page, email, password);
+  if (!loginOk) {
+    await cleanup(1);
+    return;
+  }
+}
 
     let settingsId = null;
     let refererUrl = null;
