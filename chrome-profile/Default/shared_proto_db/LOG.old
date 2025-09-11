@@ -1,3 +1,6 @@
-2025/09/11-13:27:14.483 479c Reusing MANIFEST D:\Workspace\netflix-cookie-login\chrome-profile\Default\shared_proto_db/MANIFEST-000001
-2025/09/11-13:27:14.483 479c Recovering log #3
-2025/09/11-13:27:14.486 479c Reusing old log D:\Workspace\netflix-cookie-login\chrome-profile\Default\shared_proto_db/000003.log 
+2025/09/11-15:30:24.184 1e74 Reusing MANIFEST D:\Workspace\netflix-cookie-login\chrome-profile\Default\shared_proto_db/MANIFEST-000001
+2025/09/11-15:30:24.184 1e74 Recovering log #3
+2025/09/11-15:30:24.187 1e74 Reusing old log D:\Workspace\netflix-cookie-login\chrome-profile\Default\shared_proto_db/000003.log 
+2025/09/11-15:30:24.239 2744 Level-0 table #5: started
+2025/09/11-15:30:24.244 2744 Level-0 table #5: 71597 bytes OK
+2025/09/11-15:30:24.247 2744 Delete type=0 #3
