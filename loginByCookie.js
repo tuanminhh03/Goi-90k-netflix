@@ -47,6 +47,33 @@ function isBenignNavError(err) {
   const msg = String(err?.message || err);
   return /Execution context was destroyed|Cannot find context|Target closed|frame got detached/i.test(msg);
 }
+async function setReactInputValue(frame, handle, value) {
+  return await frame.evaluate((el, v) => {
+    function setNativeValue(element, val) {
+      const { set: valueSetter } = Object.getOwnPropertyDescriptor(element, 'value') || {};
+      const prototype = Object.getPrototypeOf(element);
+      const { set: prototypeValueSetter } = Object.getOwnPropertyDescriptor(prototype, 'value') || {};
+      if (prototypeValueSetter && valueSetter !== prototypeValueSetter) {
+        prototypeValueSetter.call(element, val);
+      } else if (valueSetter) {
+        valueSetter.call(element, val);
+      } else {
+        element.value = val;
+      }
+    }
+    try {
+      el.removeAttribute?.('readonly');
+      setNativeValue(el, '');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      setNativeValue(el, v);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    } catch { return false; }
+  }, handle, value);
+}
+
 
 // chạy eval/click an toàn: nuốt lỗi do điều hướng
 async function safeRun(fn, fallback = false) {
@@ -307,18 +334,31 @@ async function clickAddProfileButton(page, { timeoutMs = 8000 } = {}) {
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    // ưu tiên selector cứng
     for (const sel of SELECTORS) {
       const hit = await queryInAllFrames(page, sel);
       if (hit?.handle) {
         await robustClickHandle(page, hit.handle);
+        // chờ hoặc modal hoặc điều hướng /add
+        await Promise.race([
+          page.waitForFunction(() =>
+            !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]'))),
+          page.waitForFunction(() =>
+            /(\/profiles\/add|\/addprofile|\/createprofile)/i.test(location.pathname)),
+          page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(()=>null),
+        ]);
         return true;
       }
     }
-    // fallback theo text
     const byText = await findButtonByTextAnyFrame(page, KEYWORDS);
     if (byText?.handle) {
       await robustClickHandle(page, byText.handle);
+      await Promise.race([
+        page.waitForFunction(() =>
+          !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]'))),
+        page.waitForFunction(() =>
+          /(\/profiles\/add|\/addprofile|\/createprofile)/i.test(location.pathname)),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(()=>null),
+      ]);
       return true;
     }
     await sleep(200);
@@ -326,36 +366,79 @@ async function clickAddProfileButton(page, { timeoutMs = 8000 } = {}) {
   return false;
 }
 
-async function waitForAddProfileModal(page, { timeoutMs = 8000 } = {}) {
-  return await page
-    .waitForFunction(() =>
-      !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]')),
-      { timeout: timeoutMs }
-    )
-    .then(() => true)
-    .catch(() => false);
+
+async function waitForAddProfileModal(page, { timeoutMs = 12000 } = {}) {
+  // Chờ một trong ba tín hiệu: (1) modal, (2) form add, (3) URL /add
+  const ok = await Promise.race([
+    page.waitForFunction(() =>
+      !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]')), { timeout: timeoutMs }
+    ).then(()=>true).catch(()=>false),
+    page.waitForFunction(() =>
+      !!(document.querySelector('input[name="profileName"]') ||
+         document.querySelector('form[action*="addProfile" i]') ||
+         document.querySelector('[data-uia*="add-profile" i]')), { timeout: timeoutMs }
+    ).then(()=>true).catch(()=>false),
+    page.waitForFunction(() =>
+      /(\/profiles\/add|\/addprofile|\/createprofile)/i.test(location.pathname), { timeout: timeoutMs }
+    ).then(()=>true).catch(()=>false),
+  ]);
+  return !!ok;
 }
 
+// Tìm input trong toàn bộ frame + shadow DOM + fallback set value trực tiếp
+
 async function typeNewProfileName(page, name) {
-  const INPUTS = [
-    'div[role="dialog"] input[name="profileName"]',
-    'div[role="dialog"] input[type="text"]',
-    'div[role="dialog"] input',
-    '[data-uia="modal"] input[name="profileName"]',
-    '[data-uia="modal"] input[type="text"]',
-    '[data-uia="modal"] input',
+  const SEL = [
+    '[data-uia="account-profiles-page+add-profile+name-input"]',
+    'div[role="dialog"] [data-uia="account-profiles-page+add-profile+name-input"]',
+    'input[name="name"][data-uia*="add-profile"]',
+    'input[name="name"]',
+    // fallback rộng:
+    '[data-uia*="add-profile+name-input"]',
+    '[data-uia*="profile"][data-uia*="name"] input[type="text"]',
   ];
-  for (const sel of INPUTS) {
-    const hit = await queryInAllFrames(page, sel);
-    if (hit?.handle) {
-      try { await hit.frame.evaluate(el => el.focus(), hit.handle); } catch {}
-      try { await hit.handle.click({ clickCount: 3 }); } catch {}
-      try { await hit.handle.type(name, { delay: 40 }); } catch {}
+
+  // chờ input xuất hiện (modal hoặc trang /profiles/add)
+  const handle = await page.waitForSelector(SEL.join(','), { visible: true, timeout: 12000 }).catch(()=>null);
+  if (!handle) return false;
+
+  // thử gõ thường trước
+  try {
+    await handle.click({ clickCount: 3 });
+    await handle.type(name, { delay: 30 });
+    return true;
+  } catch {}
+
+  // fallback React-controlled
+  const ok = await setReactInputValue(page.mainFrame(), handle, name);
+  if (ok) return true;
+
+  // fallback cuối: evaluate tìm đúng input theo data-uia rồi set
+  const ok2 = await page.evaluate((v) => {
+    const el =
+      document.querySelector('[data-uia="account-profiles-page+add-profile+name-input"]') ||
+      document.querySelector('input[name="name"][data-uia*="add-profile"]') ||
+      document.querySelector('input[name="name"]') ||
+      null;
+    if (!el) return false;
+    const { set: valueSetter } = Object.getOwnPropertyDescriptor(el, 'value') || {};
+    const proto = Object.getPrototypeOf(el);
+    const { set: protoSetter } = Object.getOwnPropertyDescriptor(proto, 'value') || {};
+    const setNative = (val) => (protoSetter && valueSetter !== protoSetter) ? protoSetter.call(el, val) : (valueSetter ? valueSetter.call(el, val) : (el.value = val));
+    try {
+      setNative('');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      setNative(v);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
-    }
-  }
-  return false;
+    } catch { return false; }
+  }, name);
+  return !!ok2;
 }
+
+
 
 async function setKidsToggleIfNeeded(page, isKids=false) {
   const TOGGLE_CANDIDATES = [
@@ -393,18 +476,111 @@ async function setKidsToggleIfNeeded(page, isKids=false) {
 }
 
 async function clickSaveNewProfile(page) {
-  const SAVE_CANDIDATES = [
+  // 1) Đảm bảo input đã có tên để nút được enable
+  await page.evaluate(() => {
+    const inp = document.querySelector('[data-uia="account-profiles-page+add-profile+name-input"]') 
+             || document.querySelector('input[name="name"]');
+    if (!inp) return;
+    const fire = (t) => inp.dispatchEvent(new Event(t, { bubbles: true }));
+    fire('input'); fire('change');
+  }).catch(()=>{});
+
+  // 2) Đóng toast/snackbar che nút (nếu có)
+  await page.evaluate(() => {
+    const sels = ['[data-uia*="toast"] [data-uia*="close"]','[aria-label*="đóng" i]','[aria-label*="close" i]'];
+    sels.forEach(s => document.querySelectorAll(s).forEach(b => { try { b.click(); } catch {} }));
+  }).catch(()=>{});
+
+  // 3) Tìm nút Lưu theo data-uia (ưu tiên) và bấm “đủ bài”
+  const selectors = [
+    '[data-uia="account-profiles-page+add-profile+primary-button"]',
+    'div[role="dialog"] button[data-uia*="primary-button"]',
     'div[role="dialog"] button[data-uia*="save" i]',
-    'div[role="dialog"] button[type="submit"]',
+    'button[type="submit"]'
   ];
-  for (const sel of SAVE_CANDIDATES) {
-    const hit = await queryInAllFrames(page, sel);
-    if (hit?.handle) { await robustClickHandle(page, hit.handle); return true; }
+
+  // quét mọi frame
+  const frames = page.frames();
+  for (const f of frames) {
+    for (const sel of selectors) {
+      let btn = null;
+      try { btn = await f.$(sel); } catch {}
+      if (!btn) continue;
+
+      // bỏ disabled nếu UI enable bằng attr/aria
+      try {
+        const enabled = await f.evaluate((el) => {
+          const st = getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          const notDisabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+          return notDisabled && st.visibility !== 'hidden' && st.display !== 'none' && rect.width > 1 && rect.height > 1;
+        }, btn);
+        if (!enabled) continue;
+      } catch {}
+
+      try { await f.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' }), btn); } catch {}
+
+      // click chuỗi sự kiện (pointerdown→mousedown→mouseup→click)
+      try {
+        await f.evaluate(el => {
+          el.focus();
+          const o = { bubbles: true, cancelable: true, view: window, buttons: 1 };
+          el.dispatchEvent(new PointerEvent('pointerdown', o));
+          el.dispatchEvent(new MouseEvent('mousedown', o));
+          el.dispatchEvent(new MouseEvent('mouseup', o));
+          el.dispatchEvent(new PointerEvent('pointerup', o));
+          el.click();
+        }, btn);
+      } catch {
+        try { await btn.click({ delay: 20 }); } catch {}
+      }
+
+      // 4) Chờ kết quả click: modal đóng / điều hướng / gọi API
+      const ok = await Promise.race([
+        // modal đóng
+        f.waitForFunction(() =>
+          !document.querySelector('div[role="dialog"]') && !document.querySelector('[data-uia="modal"]'),
+          { timeout: 5000 }).then(()=>true).catch(()=>false),
+        // trang chuyển /profiles hoặc /settings/<id>
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).then(()=>true).catch(()=>false),
+        // bắt response add profile
+        page.waitForResponse(res => {
+          const u = res.url().toLowerCase();
+          return res.status() >= 200 && res.status() < 300 &&
+                 /(add.*profile|create.*profile|profiles\/(add|create)|profile.*save)/.test(u);
+        }, { timeout: 5000 }).then(()=>true).catch(()=>false),
+      ]);
+
+      if (ok) return true;
+
+      // fallback: submit form tổ tiên nếu có
+      try {
+        const submitted = await f.evaluate((el) => {
+          const form = el.closest('form');
+          if (!form) return false;
+          if (form.requestSubmit) { form.requestSubmit(); return true; }
+          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+          return true;
+        }, btn);
+        if (submitted) {
+          await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(()=>{});
+          return true;
+        }
+      } catch {}
+    }
   }
-  const byText = await findButtonByTextAnyFrame(page, ['lưu','save','create','tạo']);
-  if (byText?.handle) { await robustClickHandle(page, byText.handle); return true; }
+
+  // 5) Phím Enter trong input (một số build bind Enter→Save)
+  try {
+    const input = await page.$('[data-uia="account-profiles-page+add-profile+name-input"], input[name="name"]');
+    if (input) { await input.focus(); await page.keyboard.press('Enter'); }
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 4000 }).catch(()=>{});
+  } catch {}
+
   return false;
 }
+
+
 
 /**
  * Tạo hồ sơ mới. Trả về { ok, settingsId }.
@@ -429,12 +605,13 @@ async function addProfile(page, name, { isKids = false } = {}) {
   const typed = await typeNewProfileName(page, name.trim());
   if (!typed) { console.log('❌ Không nhập được tên hồ sơ.'); return { ok:false, settingsId:null }; }
 
+
+
   // 4) Kids (tuỳ chọn)
   await setKidsToggleIfNeeded(page, isKids);
 
-  // 5) Lưu
-  const saved = await clickSaveNewProfile(page);
-  if (!saved) { console.log('❌ Không bấm được nút Lưu.'); return { ok:false, settingsId:null }; }
+    const saved = await clickSaveNewProfile(page);
+if (!saved) { console.log('❌ Không bấm được nút Lưu.'); return { ok:false, settingsId:null }; }
 
   // 6) Đợi modal đóng / danh sách cập nhật
   await Promise.race([
