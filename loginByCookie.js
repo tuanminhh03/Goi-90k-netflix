@@ -17,6 +17,7 @@ const COOKIE_FILE   = process.env.COOKIE_FILE   || './cookies.json';
 const HARDCODED_PASSWORD = process.env.ACCOUNT_PASSWORD || 'minhnetflix'; // mật khẩu xác thực PIN
 const NETFLIX_EMAIL    = process.env.NETFLIX_EMAIL || '';     // dùng khi cookie hỏng
 const NETFLIX_PASSWORD = process.env.NETFLIX_PASSWORD || '';  // dùng khi cookie hỏng
+const HOLD = process.argv.includes('--hold');
 
 /* ====== Graceful shutdown ====== */
 let browser; // để cleanup dùng được
@@ -26,6 +27,10 @@ async function cleanup(exitCode = 0) {
   try { await page?.close().catch(() => {}); } catch {}
   try { await browser?.close().catch(() => {}); } catch {}
   process.exit(exitCode);
+}
+async function holdOrExit(code = 0) {
+  if (HOLD) { await new Promise(()=>{}); }
+  else { await cleanup(code); }
 }
 
 process.on('SIGINT',  () => { console.log('\n🛑 SIGINT (Ctrl+C) → đóng trình duyệt...'); cleanup(0); });
@@ -43,10 +48,65 @@ process.on('unhandledRejection', (reason) => {
 
 /* ====== Helpers ====== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function raceAny(...promises) {
+  const wrapped = promises.map(p => p.catch(()=>false));
+  const res = await Promise.race(wrapped);
+  return !!res;
+}
 function isBenignNavError(err) {
   const msg = String(err?.message || err);
   return /Execution context was destroyed|Cannot find context|Target closed|frame got detached/i.test(msg);
 }
+// ===== SELECTORS MAP =====
+const S = {
+  addProfile: [
+    'button[data-uia="menu-card+button"][data-cl-view="addProfile"]',
+    'button[data-cl-view="addProfile"]',
+    '[data-uia="add-profile-button"]',
+  ],
+  addProfileNameInput: [
+    '[data-uia="account-profiles-page+add-profile+name-input"]',
+    'div[role="dialog"] [data-uia="account-profiles-page+add-profile+name-input"]',
+    'input[name="name"][data-uia*="add-profile"]',
+    'input[name="name"]',
+  ],
+  addProfileSaveBtn: [
+    '[data-uia="account-profiles-page+add-profile+primary-button"]',
+    'div[role="dialog"] button[data-uia*="primary-button"]',
+    'div[role="dialog"] button[data-uia*="save" i]',
+    'button[type="submit"]'
+  ],
+  deleteProfileBtn: [
+    'button[data-uia="profile-settings-page+delete-profile+destructive-button"]',
+    '[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]',
+    'button[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]',
+    'button[data-uia*="delete-profile" i]',
+  ],
+  removeLockBtn: [
+    'button[data-uia="profile-lock-page+remove-button"]',
+    'button[data-uia="profile-lock-remove-button"]',
+    '[data-cl-command="RemoveProfileLockCommand"]',
+  ],
+  passInput: [
+    '[data-uia="collect-password-input-modal-entry"]',
+    'input[name="password"]', 'input[type="password"]',
+    'input[autocomplete="current-password"]', 'input[autocomplete="password"]',
+  ],
+};
+
+// ===== Cache frame dialog để giảm quét =====
+let __dialogFrameCache = { ts: 0, frame: null };
+async function getDialogFrame(page, ttlMs = 2500) {
+  const now = Date.now();
+  if (__dialogFrameCache.frame && (now - __dialogFrameCache.ts) < ttlMs) return __dialogFrameCache.frame;
+  for (const f of page.frames()) {
+    const has = await f.$('div[role="dialog"], [data-uia="modal"]').catch(()=>null);
+    if (has) { __dialogFrameCache = { ts: now, frame: f }; return f; }
+  }
+  __dialogFrameCache = { ts: now, frame: null };
+  return null;
+}
+
 async function setReactInputValue(frame, handle, value) {
   return await frame.evaluate((el, v) => {
     function setNativeValue(element, val) {
@@ -74,12 +134,12 @@ async function setReactInputValue(frame, handle, value) {
   }, handle, value);
 }
 
-
 // chạy eval/click an toàn: nuốt lỗi do điều hướng
 async function safeRun(fn, fallback = false) {
   try { return await fn(); }
   catch (e) { if (isBenignNavError(e)) return fallback; throw e; }
 }
+
 function findChromePath() {
   const home = process.env.USERPROFILE || process.env.HOME || '';
   const candidates = [
@@ -97,11 +157,16 @@ function findChromePath() {
 
 function loadCookies(filePath = COOKIE_FILE) {
   if (!fs.existsSync(filePath)) return null;
-  const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-  if (Array.isArray(raw)) return { url: 'https://www.netflix.com', cookies: raw };
-  if (raw && Array.isArray(raw.cookies))
-    return { url: raw.url || 'https://www.netflix.com', cookies: raw.cookies };
-  throw new Error('cookies.json sai định dạng (mảng hoặc { url, cookies:[...] })');
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    const bundle = Array.isArray(raw) ? { url: 'https://www.netflix.com', cookies: raw } : raw;
+    if (!Array.isArray(bundle?.cookies)) throw 0;
+    const domains = new Set(bundle.cookies.map(c => c.domain || new URL(bundle.url||'https://www.netflix.com').hostname));
+    console.log(`🍪 Load ${bundle.cookies.length} cookies (${domains.size} domain).`);
+    return { url: bundle.url || 'https://www.netflix.com', cookies: bundle.cookies };
+  } catch {
+    throw new Error('cookies.json sai định dạng hoặc lỗi JSON.');
+  }
 }
 
 const sameSiteMap = {
@@ -202,10 +267,11 @@ async function loginWithCredentials(page, email, password) {
 
   const btn = await page.$(btnSel);
   if (btn) { try { await btn.click({ delay: 20 }); } catch {} } else { await page.keyboard.press('Enter'); }
-const ok = await Promise.race([
-  page.waitForFunction(() => /\/(browse|profiles|account)/i.test(location.pathname), { timeout: 30000 }).then(()=>true).catch(()=>false),
-    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).then(()=>/\/(browse|profiles|account)/i.test(page.url())).catch(()=>false),
-  ]);
+
+  const ok = await raceAny(
+    page.waitForFunction(() => /\/(browse|profiles|account)/i.test(location.pathname), { timeout: 30000 }),
+    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).then(()=>/\/(browse|profiles|account)/i.test(page.url()))
+  );
 
   if (!ok) {
     console.log('⚠️ Không xác nhận được đăng nhập (có thể cần xác minh/MFA).');
@@ -300,10 +366,10 @@ async function openProfileAndGetId(page, profileName, retries = 5) {
       await page.mouse.move(target.rect.x, target.rect.y, { steps: 6 });
       await page.mouse.down(); await sleep(30); await page.mouse.up();
     }
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }).catch(() => null),
-      page.waitForFunction(() => /\/settings\//i.test(location.pathname), { timeout: 8000 }).catch(() => null),
-    ]);
+    await raceAny(
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
+      page.waitForFunction(() => /\/settings\//i.test(location.pathname), { timeout: 8000 })
+    );
     if (await isErrorPage(page)) {
       console.log('⚠️ Trang lỗi sau khi mở hồ sơ → reload…');
       try { await page.goto(page.url(), { waitUntil: 'networkidle2', timeout: 60000 }); } catch {}
@@ -325,11 +391,7 @@ async function openProfileAndGetId(page, profileName, retries = 5) {
 /* ============== Click helpers ============== */
 // ====== Add Profile (Thêm hồ sơ) ======
 async function clickAddProfileButton(page, { timeoutMs = 8000 } = {}) {
-  const SELECTORS = [
-    'button[data-uia="menu-card+button"][data-cl-view="addProfile"]',
-    'button[data-cl-view="addProfile"]',
-    '[data-uia="add-profile-button"]',
-  ];
+  const SELECTORS = S.addProfile;
   const KEYWORDS = ['thêm hồ sơ', 'them ho so', 'add profile', 'new profile'];
 
   const deadline = Date.now() + timeoutMs;
@@ -339,26 +401,26 @@ async function clickAddProfileButton(page, { timeoutMs = 8000 } = {}) {
       if (hit?.handle) {
         await robustClickHandle(page, hit.handle);
         // chờ hoặc modal hoặc điều hướng /add
-        await Promise.race([
+        await raceAny(
           page.waitForFunction(() =>
             !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]'))),
           page.waitForFunction(() =>
             /(\/profiles\/add|\/addprofile|\/createprofile)/i.test(location.pathname)),
-          page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(()=>null),
-        ]);
+          page.waitForNavigation({ waitUntil: 'domcontentloaded' })
+        );
         return true;
       }
     }
     const byText = await findButtonByTextAnyFrame(page, KEYWORDS);
     if (byText?.handle) {
       await robustClickHandle(page, byText.handle);
-      await Promise.race([
+      await raceAny(
         page.waitForFunction(() =>
           !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]'))),
         page.waitForFunction(() =>
           /(\/profiles\/add|\/addprofile|\/createprofile)/i.test(location.pathname)),
-        page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(()=>null),
-      ]);
+        page.waitForNavigation({ waitUntil: 'domcontentloaded' })
+      );
       return true;
     }
     await sleep(200);
@@ -366,40 +428,29 @@ async function clickAddProfileButton(page, { timeoutMs = 8000 } = {}) {
   return false;
 }
 
-
 async function waitForAddProfileModal(page, { timeoutMs = 12000 } = {}) {
-  // Chờ một trong ba tín hiệu: (1) modal, (2) form add, (3) URL /add
-  const ok = await Promise.race([
+  const ok = await raceAny(
     page.waitForFunction(() =>
       !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]')), { timeout: timeoutMs }
-    ).then(()=>true).catch(()=>false),
+    ),
     page.waitForFunction(() =>
       !!(document.querySelector('input[name="profileName"]') ||
          document.querySelector('form[action*="addProfile" i]') ||
          document.querySelector('[data-uia*="add-profile" i]')), { timeout: timeoutMs }
-    ).then(()=>true).catch(()=>false),
+    ),
     page.waitForFunction(() =>
       /(\/profiles\/add|\/addprofile|\/createprofile)/i.test(location.pathname), { timeout: timeoutMs }
-    ).then(()=>true).catch(()=>false),
-  ]);
+    )
+  );
   return !!ok;
 }
 
 // Tìm input trong toàn bộ frame + shadow DOM + fallback set value trực tiếp
-
 async function typeNewProfileName(page, name) {
-  const SEL = [
-    '[data-uia="account-profiles-page+add-profile+name-input"]',
-    'div[role="dialog"] [data-uia="account-profiles-page+add-profile+name-input"]',
-    'input[name="name"][data-uia*="add-profile"]',
-    'input[name="name"]',
-    // fallback rộng:
-    '[data-uia*="add-profile+name-input"]',
-    '[data-uia*="profile"][data-uia*="name"] input[type="text"]',
-  ];
+  const SEL = S.addProfileNameInput.join(',');
 
   // chờ input xuất hiện (modal hoặc trang /profiles/add)
-  const handle = await page.waitForSelector(SEL.join(','), { visible: true, timeout: 12000 }).catch(()=>null);
+  const handle = await page.waitForSelector(SEL, { visible: true, timeout: 12000 }).catch(()=>null);
   if (!handle) return false;
 
   // thử gõ thường trước
@@ -413,7 +464,7 @@ async function typeNewProfileName(page, name) {
   const ok = await setReactInputValue(page.mainFrame(), handle, name);
   if (ok) return true;
 
-  // fallback cuối: evaluate tìm đúng input theo data-uia rồi set
+  // fallback cuối
   const ok2 = await page.evaluate((v) => {
     const el =
       document.querySelector('[data-uia="account-profiles-page+add-profile+name-input"]') ||
@@ -438,34 +489,26 @@ async function typeNewProfileName(page, name) {
   return !!ok2;
 }
 
-
-
 async function setKidsToggleIfNeeded(page, isKids=false) {
   const TOGGLE_CANDIDATES = [
     'div[role="dialog"] [data-uia*="kids" i]',
     'div[role="dialog"] [aria-label*="trẻ" i], div[role="dialog"] [aria-label*="kids" i]',
     'div[role="dialog"] input[type="checkbox"]',
   ];
-  // nếu không yêu cầu thì bỏ qua
   if (typeof isKids !== 'boolean') return true;
 
   for (const sel of TOGGLE_CANDIDATES) {
     const hit = await queryInAllFrames(page, sel);
     if (hit?.handle) {
-      // đọc trạng thái nếu là input checkbox
       const state = await hit.frame.evaluate(el => {
         if (el.tagName === 'INPUT' && el.type === 'checkbox') return el.checked;
-        // với nút gạt custom, thử nhìn aria-pressed/aria-checked
         const pressed = el.getAttribute('aria-pressed');
         const checked = el.getAttribute('aria-checked');
         if (pressed != null) return pressed === 'true';
         if (checked != null) return checked === 'true';
-        return null; // không xác định
+        return null;
       }, hit.handle).catch(()=>null);
-
-      // nếu không xác định, cứ bỏ qua để tránh click sai
       if (state === null) return true;
-
       if (state !== isKids) {
         await robustClickHandle(page, hit.handle);
       }
@@ -491,15 +534,9 @@ async function clickSaveNewProfile(page) {
     sels.forEach(s => document.querySelectorAll(s).forEach(b => { try { b.click(); } catch {} }));
   }).catch(()=>{});
 
-  // 3) Tìm nút Lưu theo data-uia (ưu tiên) và bấm “đủ bài”
-  const selectors = [
-    '[data-uia="account-profiles-page+add-profile+primary-button"]',
-    'div[role="dialog"] button[data-uia*="primary-button"]',
-    'div[role="dialog"] button[data-uia*="save" i]',
-    'button[type="submit"]'
-  ];
+  // 3) Tìm & click Save
+  const selectors = S.addProfileSaveBtn;
 
-  // quét mọi frame
   const frames = page.frames();
   for (const f of frames) {
     for (const sel of selectors) {
@@ -507,7 +544,6 @@ async function clickSaveNewProfile(page) {
       try { btn = await f.$(sel); } catch {}
       if (!btn) continue;
 
-      // bỏ disabled nếu UI enable bằng attr/aria
       try {
         const enabled = await f.evaluate((el) => {
           const st = getComputedStyle(el);
@@ -520,7 +556,6 @@ async function clickSaveNewProfile(page) {
 
       try { await f.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' }), btn); } catch {}
 
-      // click chuỗi sự kiện (pointerdown→mousedown→mouseup→click)
       try {
         await f.evaluate(el => {
           el.focus();
@@ -535,25 +570,20 @@ async function clickSaveNewProfile(page) {
         try { await btn.click({ delay: 20 }); } catch {}
       }
 
-      // 4) Chờ kết quả click: modal đóng / điều hướng / gọi API
-      const ok = await Promise.race([
-        // modal đóng
+      const ok = await raceAny(
         f.waitForFunction(() =>
-          !document.querySelector('div[role="dialog"]') && !document.querySelector('[data-uia="modal"]'),
-          { timeout: 5000 }).then(()=>true).catch(()=>false),
-        // trang chuyển /profiles hoặc /settings/<id>
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).then(()=>true).catch(()=>false),
-        // bắt response add profile
+          !document.querySelector('div[role="dialog"]') && !document.querySelector('[data-uia="modal"]'), { timeout: 5000 }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }),
         page.waitForResponse(res => {
           const u = res.url().toLowerCase();
           return res.status() >= 200 && res.status() < 300 &&
                  /(add.*profile|create.*profile|profiles\/(add|create)|profile.*save)/.test(u);
-        }, { timeout: 5000 }).then(()=>true).catch(()=>false),
-      ]);
+        }, { timeout: 5000 })
+      );
 
       if (ok) return true;
 
-      // fallback: submit form tổ tiên nếu có
+      // fallback submit
       try {
         const submitted = await f.evaluate((el) => {
           const form = el.closest('form');
@@ -570,17 +600,15 @@ async function clickSaveNewProfile(page) {
     }
   }
 
-  // 5) Phím Enter trong input (một số build bind Enter→Save)
+  // 5) Enter
   try {
-    const input = await page.$('[data-uia="account-profiles-page+add-profile+name-input"], input[name="name"]');
+    const input = await page.$(S.addProfileNameInput.join(','));
     if (input) { await input.focus(); await page.keyboard.press('Enter'); }
     await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 4000 }).catch(()=>{});
   } catch {}
 
   return false;
 }
-
-
 
 /**
  * Tạo hồ sơ mới. Trả về { ok, settingsId }.
@@ -605,19 +633,17 @@ async function addProfile(page, name, { isKids = false } = {}) {
   const typed = await typeNewProfileName(page, name.trim());
   if (!typed) { console.log('❌ Không nhập được tên hồ sơ.'); return { ok:false, settingsId:null }; }
 
-
-
   // 4) Kids (tuỳ chọn)
   await setKidsToggleIfNeeded(page, isKids);
 
-    const saved = await clickSaveNewProfile(page);
-if (!saved) { console.log('❌ Không bấm được nút Lưu.'); return { ok:false, settingsId:null }; }
+  const didSaveProfile = await clickSaveNewProfile(page);
+  if (!didSaveProfile) { console.log('❌ Không bấm được nút Lưu.'); return { ok:false, settingsId:null }; }
 
   // 6) Đợi modal đóng / danh sách cập nhật
-  await Promise.race([
-    page.waitForFunction(() => !document.querySelector('div[role="dialog"]') && !document.querySelector('[data-uia="modal"]'), { timeout: 8000 }).catch(()=>null),
-    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(()=>null),
-  ]);
+  await raceAny(
+    page.waitForFunction(() => !document.querySelector('div[role="dialog"]') && !document.querySelector('[data-uia="modal"]'), { timeout: 8000 }),
+    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 })
+  );
 
   // 7) Xác nhận tên xuất hiện trong danh sách + lấy settingsId
   await page.goto('https://www.netflix.com/account/profiles', { waitUntil: 'networkidle2', timeout: 30000 }).catch(()=>{});
@@ -690,15 +716,11 @@ async function clickSecondDeleteButton(page, { timeoutMs = 6000 } = {}) {
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    // Ưu tiên frame có dialog/modal
-    const frames = page.frames();
-    for (const f of frames) {
-      const hasDialog = await f.$('div[role="dialog"], [data-uia="modal"], [aria-modal="true"]').catch(()=>null);
-      if (!hasDialog) continue;
-
+    // Ưu tiên frame có dialog
+    const f = await getDialogFrame(page);
+    if (f) {
       const btn = await f.$(SELECTOR);
       if (btn) {
-        // cuộn + click an toàn
         try { await f.evaluate(el => el.scrollIntoView({block:'center',inline:'center'}), btn); } catch {}
         try { await btn.click({ delay: 20 }); return true; } catch {}
         try {
@@ -716,7 +738,7 @@ async function clickSecondDeleteButton(page, { timeoutMs = 6000 } = {}) {
       }
     }
 
-    // Fallback: đôi khi portal gắn thẳng lên main frame
+    // Fallback: main frame
     const btnMain = await page.$(SELECTOR).catch(()=>null);
     if (btnMain) {
       try { await page.evaluate(el => el.scrollIntoView({block:'center',inline:'center'}), btnMain); } catch {}
@@ -728,8 +750,7 @@ async function clickSecondDeleteButton(page, { timeoutMs = 6000 } = {}) {
   return false;
 }
 
-
-// Tìm nút theo TEXT ở mọi frame (không dùng :has-text)
+// Tìm nút theo TEXT ở mọi frame
 async function findButtonByTextAnyFrame(page, keywords = []) {
   const frames = page.frames();
   const lows = keywords.map(k => k.toLowerCase());
@@ -748,103 +769,7 @@ async function findButtonByTextAnyFrame(page, keywords = []) {
   }
   return null;
 }
-// Bấm nút "Xóa hồ sơ" TRONG OVERLAY/MODAL (quét cả body, dialog, portal, iframe, shadow) – retry ngắn
-async function clickDangerDeleteInAnyOverlay(page, { timeoutMs = 5000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
 
-  // Hàm chạy trong frame: ưu tiên nút trong dialog, sau đó toàn trang (đề phòng portal)
-  const clickInFrame = async (frame) => {
-    return await frame.evaluate(() => {
-      const visible = (el) => {
-        if (!el) return false;
-        const st = getComputedStyle(el), r = el.getBoundingClientRect();
-        return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 1 && r.height > 1 && !el.disabled;
-      };
-
-      // 1) Dialog/modal container
-      const dialog = document.querySelector('div[role="dialog"], [data-uia="modal"], [aria-modal="true"]') || document.body;
-
-      // 2) Tick mọi checkbox “Tôi hiểu” nếu có
-      dialog.querySelectorAll('input[type="checkbox"],[role="checkbox"]').forEach(el => {
-        try {
-          if (el instanceof HTMLInputElement) { if (!el.checked) el.click(); }
-          else if (el.getAttribute('aria-checked') === 'false') el.click();
-        } catch {}
-      });
-
-      // 3) Tìm nút “Xóa hồ sơ / Delete profile / Delete”
-      const buttons = Array.from(dialog.querySelectorAll('button,[role="button"]'));
-      const target = buttons.find(b => {
-        const t = (b.textContent || '').trim().toLowerCase();
-        return visible(b) && (
-          t.includes('xóa hồ sơ') || t.includes('xoá hồ sơ') ||
-          t.includes('delete profile') || t === 'delete' || t.includes('delete')
-        );
-      }) || buttons.find(b => {
-        // fallback: destructive button (màu đỏ) không có text rõ
-        const t = (b.textContent || '').trim().toLowerCase();
-        return visible(b) && (b.dataset?.uia?.includes('delete') || /destructive|danger/i.test(b.className) || t.includes('xóa') || t.includes('xoá'));
-      });
-
-      if (!target) return false;
-      try { target.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
-      try { target.focus(); } catch {}
-      target.click();
-      return true;
-    }).catch(() => false);
-  };
-
-  // Bịt phím gây đóng modal
-  await page.evaluate(() => {
-    const trap = (e) => {
-      if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-        e.stopImmediatePropagation(); e.stopPropagation(); e.preventDefault();
-      }
-    };
-    window.__nfDelTrap2 && document.removeEventListener('keydown', window.__nfDelTrap2, true);
-    window.__nfDelTrap2 = trap;
-    document.addEventListener('keydown', trap, true);
-  }).catch(() => {});
-
-  // Vòng retry ngắn đến khi click được hoặc hết thời gian
-  while (Date.now() < deadline) {
-    // Ưu tiên những frame đang có dialog
-    const frames = page.frames();
-    let done = false;
-
-    // Thử trong frame có dialog trước
-    for (const f of frames) {
-      const hasDialog = await f.$('div[role="dialog"], [data-uia="modal"], [aria-modal="true"]').catch(()=>null);
-      if (hasDialog) { done = await clickInFrame(f); if (done) break; }
-    }
-    // Nếu chưa được, quét tất cả frame (portal có thể nằm ngoài dialog)
-    if (!done) {
-      for (const f of frames) { done = await clickInFrame(f); if (done) break; }
-    }
-    if (done) {
-      // gỡ trap phím
-      await page.evaluate(() => {
-        if (window.__nfDelTrap2) {
-          document.removeEventListener('keydown', window.__nfDelTrap2, true);
-          window.__nfDelTrap2 = null;
-        }
-      }).catch(()=>{});
-      return true;
-    }
-    await sleep(120);
-  }
-
-  // gỡ trap phím nếu thất bại
-  await page.evaluate(() => {
-    if (window.__nfDelTrap2) {
-      document.removeEventListener('keydown', window.__nfDelTrap2, true);
-      window.__nfDelTrap2 = null;
-    }
-  }).catch(()=>{});
-  return false;
-}
-
-// Tìm phần tử theo danh sách selector ở mọi frame; trả về phần tử đầu tiên tồn tại
 async function findFirstVisibleInFrames(page, selectors = []) {
   for (const sel of selectors) {
     const hit = await queryInAllFrames(page, sel);
@@ -852,7 +777,6 @@ async function findFirstVisibleInFrames(page, selectors = []) {
   }
   return null;
 }
-
 
 async function typeProfileNameInConfirmDialog(page, name) {
   if (!name) return false;
@@ -907,16 +831,14 @@ async function findButtonAnyFrame(page, selectors = [], keywords = []) {
   return null;
 }
 
-/* ===== Identity verify modal: chọn "Xác nhận mật khẩu" và nhập pass ===== */
+/* ===== Identity verify modal ===== */
 async function handleIdentityVerifyModal(page, password) {
-  // chờ dialog xuất hiện (tối đa ~6s)
   for (let i = 0; i < 12; i++) {
     const open = await page.evaluate(() => !!(document.querySelector('[role="dialog"], [data-uia="modal"]'))).catch(()=>false);
     if (open) break;
     await sleep(500);
   }
 
-  // tìm & bấm "Xác nhận mật khẩu"
   const passOption = await findButtonByTextAnyFrame(page, [
     'xác nhận mật khẩu','confirm with password','verify with password','password','mật khẩu'
   ]);
@@ -925,15 +847,9 @@ async function handleIdentityVerifyModal(page, password) {
     await robustClickHandle(page, passOption.handle);
   }
 
-  // tìm ô password (retry qua animation/iframe)
-  const PASS_INPUTS = [
-    '[data-uia="collect-password-input-modal-entry"]',
-    'input[name="password"]', 'input[type="password"]',
-    'input[autocomplete="current-password"]', 'input[autocomplete="password"]',
-  ];
   let passField = null;
   for (let t = 0; t < 20 && !passField; t++) {
-    for (const sel of PASS_INPUTS) {
+    for (const sel of S.passInput) {
       const hit = await queryInAllFrames(page, sel);
       if (hit?.handle) { passField = hit; break; }
     }
@@ -941,13 +857,11 @@ async function handleIdentityVerifyModal(page, password) {
   }
   if (!passField) return false;
 
-  // focus + type + submit
   try { await passField.frame.evaluate(el => el.focus(), passField.handle); } catch {}
   try { await passField.handle.click({ clickCount: 2 }); } catch {}
   try { await passField.handle.type(password, { delay: 40 }); } catch {}
   try { await page.keyboard.press('Enter'); } catch {}
 
-  // đợi dialog đóng
   for (let i = 0; i < 20; i++) {
     const open = await page.evaluate(() => !!(document.querySelector('[role="dialog"], [data-uia="modal"]'))).catch(()=>false);
     if (!open) return true;
@@ -956,7 +870,6 @@ async function handleIdentityVerifyModal(page, password) {
   return false;
 }
 
-// Đợi URL có ?profilePinDeleted=success (sau khi remove lock)
 async function waitForProfileDeletedSuccess(page, timeout = 15000) {
   return await page
     .waitForFunction(() => {
@@ -969,7 +882,7 @@ async function waitForProfileDeletedSuccess(page, timeout = 15000) {
     .then(() => true)
     .catch(() => false);
 }
-// Đợi tín hiệu đã gỡ khóa hồ sơ thành công (ở /settings/<ID> hoặc /account/profiles)
+
 async function waitForProfilePinDeletedSuccess(page, timeout = 15000) {
   return await page
     .waitForFunction(() => {
@@ -989,8 +902,6 @@ async function waitForProfilePinDeletedSuccess(page, timeout = 15000) {
     .catch(() => false);
 }
 
-
-// Click "Tạo khóa hồ sơ" trong mọi frame
 async function clickCreateProfileLockAnyFrame(page) {
   const SEL = 'button[data-uia="profile-lock-off+add-button"], button[data-cl-command="AddProfileLockCommand"]';
   for (let attempt = 1; attempt <= 5; attempt++) {
@@ -1054,43 +965,6 @@ async function robustClickHandle(page, handle) {
   return false;
 }
 
-// ==== Tìm nút thùng rác (Delete) trên mọi frame ====
-async function findTrashButtonAnyFrame(page) {
-  // Các selector khả dĩ: data-uia, command, hoặc SVG icon TrashCan
-  const selectors = [
-    'button[data-uia="account-profile-delete-button"]',
-    '[data-cl-command="DeleteProfileCommand"]',
-    // Nhiều UI gắn aria-label hoặc title dạng Delete/Xóa:
-    'button[aria-label*="Delete" i]',
-    'button[aria-label*="Xóa" i], button[aria-label*="Xoá" i]',
-    'button[title*="Delete" i], button[title*="Xóa" i], button[title*="Xoá" i]',
-  ];
-
-  // 1) Thử các selector trực tiếp
-  const hit = await findFirstVisibleInFrames(page, selectors);
-  if (hit) return hit;
-
-  // 2) Fallback: SVG TrashCan → tìm button/ancestor click được
-  const svgHit = await queryInAllFrames(page, 'svg[data-icon*="TrashCan" i], svg[data-icon-id*="TrashCan" i]');
-  if (svgHit?.handle) {
-    const { frame, handle } = svgHit;
-    try {
-      const btn = await frame.evaluateHandle((svg) => {
-        let el = svg;
-        for (let i = 0; i < 5 && el; i++) { // leo tối đa 5 cấp
-          if (el.tagName === 'BUTTON' || el.getAttribute?.('role') === 'button') return el;
-          el = el.parentElement;
-        }
-        return svg.closest?.('button,[role="button"]') || null;
-      }, handle);
-      if (btn && (await btn.asElement())) return { frame, handle: btn.asElement() };
-    } catch {}
-    // Fallback nữa: click trực tiếp ancestor div của svg
-    return svgHit;
-  }
-  return null;
-}
-
 // ==== Điều hướng cứng vào /settings/<ID> (không phải lock) ====
 async function hardGotoSettings(page, settingsId, refererUrl) {
   const settingsUrl = `https://www.netflix.com/settings/${settingsId}`;
@@ -1107,13 +981,13 @@ async function hardGotoSettings(page, settingsId, refererUrl) {
     else if (how === 'assign')
       await page.evaluate((u)=>{ window.location.assign(u); }, settingsUrl).catch(()=>{});
 
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }).catch(()=>null),
+    await raceAny(
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
       page.waitForFunction(
         (id)=> new RegExp(`/settings/${id}($|[/?#])`).test(location.pathname),
         { timeout: 8000 }, settingsId
-      ).catch(()=>null),
-    ]);
+      )
+    );
 
     if (await isErrorPage(page)) {
       console.log('⚠️ Trang lỗi khi vào settings → reload…');
@@ -1130,23 +1004,14 @@ async function hardGotoSettings(page, settingsId, refererUrl) {
 
 // ==== Tìm nút "Xóa hồ sơ" trên mọi frame ====
 async function findDeleteProfileButtonAnyFrame(page) {
-  const selectors = [
-    'button[data-uia="profile-settings-page+delete-profile+destructive-button"]', // bạn cung cấp
-    '[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]',
-    'button[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]',
-    'button[data-uia*="delete-profile" i]',
-  ];
-  const hit = await findFirstVisibleInFrames(page, selectors);
+  const hit = await findFirstVisibleInFrames(page, S.deleteProfileBtn);
   if (hit) return hit;
-
   const byText = await findButtonByTextAnyFrame(page, ['xóa hồ sơ','xoá hồ sơ','delete profile']);
   return byText || null;
 }
 
-
 // ==== Nếu hiện dialog/sheet xác nhận thì tick checkbox & bấm xác nhận ====
 async function clickConfirmDeleteDialogsIfAny(page) {
-  // Tick checkbox (nếu có)
   const checkSel = [
     'div[role="dialog"] input[type="checkbox"]',
     '[data-uia="modal"] input[type="checkbox"]',
@@ -1166,14 +1031,12 @@ async function clickConfirmDeleteDialogsIfAny(page) {
     }
   }
 
-  // Bấm nút xác nhận trong dialog
   const confirm =
     await findButtonByTextAnyFrame(page, ['xóa hồ sơ','xoá hồ sơ','delete','ok','confirm','yes','có']) ||
     await findFirstVisibleInFrames(page, ['div[role="dialog"] button','[data-uia="modal"] button']);
   if (confirm?.handle) await robustClickHandle(page, confirm.handle);
 }
 
-// Click 1 lần duy nhất, không fallback (tránh toggle đóng/mở)
 async function singleClick(page, handle) {
   try { await page.evaluate(el => el.scrollIntoView({block:'center',inline:'center'}), handle); } catch {}
   try { await page.evaluate(el => el.click(), handle); return true; } catch {}
@@ -1181,11 +1044,8 @@ async function singleClick(page, handle) {
   return false;
 }
 
-// Mở overlay xác nhận xóa và chờ modal hiện rõ (không di chuột/scroll thêm)
-// === XÓA HỒ SƠ ATOMIC: mở overlay & xác nhận ngay trong cùng 1 evaluate ===
 async function atomicOpenAndConfirmDelete(page, profileNameForConfirm = null, timeoutMs = 2500) {
   const ok = await page.evaluate(async (profileName, timeout) => {
-    // 1) Mở overlay xóa (click ngay nút Xóa hồ sơ ở trang /settings/<ID>)
     const openBtn =
       document.querySelector('button[data-uia="profile-settings-page+delete-profile+destructive-button"]') ||
       document.querySelector('[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]') ||
@@ -1193,7 +1053,6 @@ async function atomicOpenAndConfirmDelete(page, profileNameForConfirm = null, ti
     if (!openBtn) return false;
     openBtn.click();
 
-    // 2) Chờ modal/dialog xuất hiện (poll nhanh)
     const start = Date.now();
     function findDialog() {
       return document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]');
@@ -1204,10 +1063,8 @@ async function atomicOpenAndConfirmDelete(page, profileNameForConfirm = null, ti
     }
     const dialog = findDialog();
 
-    // 3) Khoá scroll để tránh overlay tự đóng do wheel/scroll
     try { document.documentElement.style.overflow = 'hidden'; } catch {}
 
-    // 4) Tick mọi checkbox “Tôi hiểu/Confirm” nếu có
     dialog.querySelectorAll('input[type="checkbox"], [role="checkbox"]').forEach(el => {
       try {
         if (el instanceof HTMLInputElement) {
@@ -1218,7 +1075,6 @@ async function atomicOpenAndConfirmDelete(page, profileNameForConfirm = null, ti
       } catch {}
     });
 
-    // 5) Nếu yêu cầu gõ tên hồ sơ → điền luôn
     if (profileName) {
       const inp = dialog.querySelector('input[type="text"], input');
       if (inp) {
@@ -1232,7 +1088,6 @@ async function atomicOpenAndConfirmDelete(page, profileNameForConfirm = null, ti
       }
     }
 
-    // 6) Tìm nút xác nhận trong dialog và click
     const btns = Array.from(dialog.querySelectorAll('button, [role="button"]'));
     const danger =
       btns.find(b => /xóa hồ sơ|xoá hồ sơ|delete profile/i.test(b.textContent || '')) ||
@@ -1247,7 +1102,6 @@ async function atomicOpenAndConfirmDelete(page, profileNameForConfirm = null, ti
   return !!ok;
 }
 
-// ==== Utility: kiểm tra visible/enabled ====
 function __isClickable(el) {
   if (!el) return false;
   const st = window.getComputedStyle(el);
@@ -1258,7 +1112,6 @@ function __isClickable(el) {
   return true;
 }
 
-// ==== Utility: tìm trong shadow DOM ====
 function __queryDeep(root, selectors) {
   const stack = [root];
   while (stack.length) {
@@ -1270,17 +1123,12 @@ function __queryDeep(root, selectors) {
         if (found) return found;
       }
     }
-    // shadow root
     if (node.shadowRoot) stack.push(node.shadowRoot);
-    // children
     if (node.children) for (const c of node.children) stack.push(c);
   }
   return null;
 }
 
-// ==== Bấm nút "Xóa hồ sơ" (trả true nếu click được) ====
-
-// Đóng mọi toast/snackbar có thể che nút trong modal
 async function closeOverlaysIfAny(page) {
   await page.evaluate(() => {
     const candidates = [
@@ -1295,7 +1143,6 @@ async function closeOverlaysIfAny(page) {
   }).catch(()=>{});
 }
 
-// Tìm dialog trong mọi frame
 async function findDialogAnyFrame(page) {
   const frames = page.frames();
   for (const f of frames) {
@@ -1305,16 +1152,9 @@ async function findDialogAnyFrame(page) {
   return null;
 }
 
-// Bấm nút "Xóa hồ sơ" trong modal (đa frame, có đóng toast, cuộn, Enter/Space, click)
-
-// === 1) Click nút "Xóa hồ sơ" TRÊN TRANG /settings/<ID> (main frame, 1 lần) ===
+// === 1) Click nút “Xóa hồ sơ” TRÊN TRANG /settings/<ID> (global) ===
 async function clickDeleteProfileButtonStrict(page, { retry = 3 } = {}) {
-  const SELECTORS = [
-    'button[data-uia="profile-settings-page+delete-profile+destructive-button"]',
-    '[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]',
-    'button[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]',
-    'button[data-uia*="delete-profile" i]',
-  ];
+  const SELECTORS = S.deleteProfileBtn;
   const KEYWORDS = ['xóa hồ sơ','xoá hồ sơ','delete profile','delete'];
 
   for (let i = 0; i < retry; i++) {
@@ -1336,32 +1176,29 @@ async function clickDeleteProfileButtonStrict(page, { retry = 3 } = {}) {
       if (!btn) return false;
       try { btn.scrollIntoView({block:'center', inline:'center'}); } catch {}
       try { btn.focus(); } catch {}
-      btn.click(); // 1 lần duy nhất
+      btn.click();
       return true;
     }, { SELECTORS, KEYWORDS }).catch(() => false);
 
     if (ok) return true;
-    await new Promise(r => setTimeout(r, 150));
+    await sleep(150);
   }
   return false;
 }
 
-// === 2) Click nút "Xóa hồ sơ" TRONG MODAL (strict: chặn phím, đóng toast, không blur) ===
+// === 2) Click nút "Xóa hồ sơ" TRONG MODAL ===
 async function clickConfirmDeleteInDialog(page, timeoutMs = 6000) {
-  // Đợi modal xuất hiện
   const hasDialog = await page.waitForFunction(() =>
     !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]')),
     { timeout: timeoutMs }
   ).then(() => true).catch(() => false);
   if (!hasDialog) return false;
 
-  // Đóng toast/snackbar che khu vực
   await page.evaluate(() => {
     const sel = ['[data-uia*="toast"] [data-uia*="close"]','[aria-label*="đóng" i]','[aria-label*="close" i]'];
     sel.forEach(s => document.querySelectorAll(s).forEach(b => { try { b.click(); } catch {} }));
   }).catch(()=>{});
 
-  // Ngăn Escape/Enter làm đóng modal hoặc kích hoạt thứ khác phía sau (lock)
   await page.evaluate(() => {
     const trap = (e) => {
       if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
@@ -1373,12 +1210,10 @@ async function clickConfirmDeleteInDialog(page, timeoutMs = 6000) {
     document.addEventListener('keydown', trap, true);
   });
 
-  // Click đúng nút trong modal (quét trong modal thôi)
   const clicked = await page.evaluate(() => {
     const dialog = document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]');
     if (!dialog) return false;
 
-    // Khoá scroll nền + đưa modal vào giữa
     try { document.documentElement.style.overflow = 'hidden'; } catch {}
     try { dialog.scrollTop = dialog.scrollHeight; } catch {}
 
@@ -1395,11 +1230,10 @@ async function clickConfirmDeleteInDialog(page, timeoutMs = 6000) {
 
     try { target.scrollIntoView({block:'center', inline:'center'}); } catch {}
     try { target.focus(); } catch {}
-    target.click(); // 1 lần, không phát phím
+    target.click();
     return true;
   }).catch(() => false);
 
-  // Bỏ trap phím (dọn dẹp)
   await page.evaluate(() => {
     if (window.__nfDelTrap) {
       document.removeEventListener('keydown', window.__nfDelTrap, true);
@@ -1410,7 +1244,6 @@ async function clickConfirmDeleteInDialog(page, timeoutMs = 6000) {
   return !!clicked;
 }
 
-/* ============== XÓA HỒ SƠ – chỉ thao tác trên /settings/<ID> ============== */
 /* ============== XÓA HỒ SƠ – chỉ thao tác trên /settings/<ID> ============== */
 async function deleteProfileBySettingsId(
   page,
@@ -1426,62 +1259,16 @@ async function deleteProfileBySettingsId(
     return false;
   }
 
-  // ===== Helper nội bộ: click nút "Xóa hồ sơ" chắc chắn =====
-  async function clickDeleteProfileButtonStrict() {
-    const SELECTORS = [
-      'button[data-uia="profile-settings-page+delete-profile+destructive-button"]',
-      '[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]',
-      'button[data-cl-view="deleteProfile"][data-cl-command="SubmitCommand"]',
-      'button[data-uia*="delete-profile" i]',
-    ];
-    const KEYWORDS = ['xóa hồ sơ','xoá hồ sơ','delete profile','delete'];
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      for (const f of page.frames()) {
-        const clicked = await f.evaluate(({ SELECTORS, KEYWORDS }) => {
-          function visible(el) {
-            if (!el) return false;
-            const st = window.getComputedStyle(el);
-            if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
-            const r = el.getBoundingClientRect();
-            return r.width > 1 && r.height > 1 && !el.disabled;
-          }
-          let btn = null;
-          for (const sel of SELECTORS) {
-            const cand = document.querySelector(sel);
-            if (cand && visible(cand)) { btn = cand; break; }
-          }
-          if (!btn) {
-            const nodes = Array.from(document.querySelectorAll('button,[role="button"]'));
-            btn = nodes.find(n => {
-              const t = (n.textContent || '').toLowerCase();
-              return visible(n) && KEYWORDS.some(k => t.includes(k));
-            }) || null;
-          }
-          if (!btn) return false;
-          try { btn.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
-          try { btn.focus(); } catch {}
-          btn.click();
-          return true;
-        }, { SELECTORS, KEYWORDS }).catch(() => false);
-        if (clicked) return true;
-      }
-      await sleep(200);
-    }
-    return false;
-  }
-
-// 1) Click nút “Xóa hồ sơ” để mở overlay (dùng bản global)
-console.log('🗑️ Tìm & bấm nút "Xóa hồ sơ"…');
-const ok1 = await safeRun(() => clickDeleteProfileButtonStrict(page, { retry: 3 }), false);
-await safeRun(() => Promise.race([
-  page.waitForFunction(() =>
-    !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]')),
-    { timeout: 8000 }
-  ),
-  // nếu UI thật sự điều hướng thì cũng bắt được
-  page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 })
-]), null);
+  // 1) Click nút “Xóa hồ sơ” để mở overlay (dùng bản global)
+  console.log('🗑️ Tìm & bấm nút "Xóa hồ sơ"…');
+  const ok1 = await safeRun(() => clickDeleteProfileButtonStrict(page, { retry: 3 }), false);
+  await safeRun(() => Promise.race([
+    page.waitForFunction(() =>
+      !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]')),
+      { timeout: 8000 }
+    ),
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 })
+  ]), null);
 
   // 2) Chờ overlay (modal) xuất hiện
   const overlayOk = await page.waitForFunction(() =>
@@ -1499,31 +1286,29 @@ await safeRun(() => Promise.race([
       { timeout: 4000 }
     ).catch(() => {});
   }
+
   console.log('🗑️ Bấm "Xóa hồ sơ" trong modal xác nhận…');
-const ok2 = await safeRun(() => clickSecondDeleteButton(page, { timeoutMs: 6000 }), false);
-if (!ok2) {
-  await closeOverlaysIfAny(page);
-  const retry = await safeRun(() => clickSecondDeleteButton(page, { timeoutMs: 6000 }), false);
-  if (!retry) return false;
-}
+  const ok2 = await safeRun(() => clickSecondDeleteButton(page, { timeoutMs: 6000 }), false);
+  if (!ok2) {
+    await closeOverlaysIfAny(page);
+    const retry = await safeRun(() => clickSecondDeleteButton(page, { timeoutMs: 6000 }), false);
+    if (!retry) return false;
+  }
 
-
-// (giữ nguyên các bước sau – nếu UI yêu cầu gõ tên/checkbox/mật khẩu)
-await typeProfileNameInConfirmDialog(page, profileNameForConfirm); // nếu cần gõ tên
-await clickConfirmDeleteDialogsIfAny(page); // tick checkbox / nút OK phụ
-await confirmDangerInDialog(page);          // phòng khi Netflix render thêm nút xác nhận
-await handleIdentityVerifyModal(page, password); // bắt case yêu cầu nhập mật khẩu
+  await typeProfileNameInConfirmDialog(page, profileNameForConfirm); // nếu cần gõ tên
+  await clickConfirmDeleteDialogsIfAny(page); // tick checkbox / nút OK phụ
+  await confirmDangerInDialog(page);          // phòng khi Netflix render thêm nút xác nhận
+  await handleIdentityVerifyModal(page, password); // bắt case yêu cầu nhập mật khẩu
 
   // 6) Chờ tín hiệu đã xóa hoặc quay về danh sách hồ sơ
-  const redirected = await Promise.race([
-    page.waitForFunction(() => /\/account\/profiles/i.test(location.pathname),
-      { timeout: 15000 }).then(() => true).catch(() => false),
+  const redirected = await raceAny(
+    page.waitForFunction(() => /\/account\/profiles/i.test(location.pathname), { timeout: 15000 }),
     page.waitForResponse(res => {
       const u = res.url().toLowerCase();
       return res.status() >= 200 && res.status() < 300 &&
              /(delete.*profile|profile.*delete|remove.*profile)/.test(u);
-    }, { timeout: 15000 }).then(() => true).catch(() => false),
-  ]);
+    }, { timeout: 15000 })
+  );
 
   // 7) Kiểm tra danh sách hồ sơ để chắc chắn hồ sơ đã biến mất
   let removedByList = true;
@@ -1546,12 +1331,10 @@ await handleIdentityVerifyModal(page, password); // bắt case yêu cầu nhập
 }
 
 async function deleteProfileSmart(page, profileOrId, password, refererUrl) {
-  // Nếu truyền ID thẳng
   if (/^[A-Z0-9]+$/.test(profileOrId)) {
     return await deleteProfileBySettingsId(page, profileOrId, password, refererUrl);
   }
 
-  // Nếu truyền tên hồ sơ → mở để lấy settingsId
   await page.goto('https://www.netflix.com/account/profiles', { waitUntil: 'networkidle2', timeout: 60000 });
   await gentleReveal(page);
 
@@ -1566,7 +1349,6 @@ async function deleteProfileSmart(page, profileOrId, password, refererUrl) {
 
   return await deleteProfileBySettingsId(page, res.id, password, res.settingsUrl);
 }
-
 
 /* ============== Điều hướng cứng vào /settings/lock/<ID> ============== */
 async function hardGotoLock(page, settingsId, refererUrl) {
@@ -1583,13 +1365,13 @@ async function hardGotoLock(page, settingsId, refererUrl) {
     else if (how === 'assign')
       await page.evaluate((u) => { window.location.assign(u); }, lockUrl).catch(() => {});
 
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }).catch(() => null),
+    await raceAny(
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
       page.waitForFunction(
         (id) => location.pathname.includes(`/settings/lock/${id}`) || /\/settings\//.test(location.pathname),
         { timeout: 8000 }, settingsId
-      ).catch(() => null),
-    ]);
+      )
+    );
 
     if (await isErrorPage(page)) {
       console.log('⚠️ Trang lỗi sau khi vào lock → reload…');
@@ -1630,16 +1412,13 @@ async function goPinAndAuth(page, settingsId, password, refererUrl) {
     return true;
   }
 
-  // ⛔ Nếu có REMOVE thì KHÔNG làm gì ở đây, để caller xử lý gỡ trước
   if (await hasRemoveButtonAnyFrame(page)) {
     console.log('🔒 Thấy nút "Xóa khóa hồ sơ" → bỏ qua Create/Edit, trả về cho caller xử lý gỡ.');
     return false;
   }
 
-  // ✅ Chỉ click "Tạo khóa hồ sơ" (KHÔNG click Edit PIN)
   let clicked = await clickCreateProfileLockAnyFrame(page);
 
-  // Fallback: kích hoạt command trực tiếp
   if (!clicked) {
     const didCmd = await page.evaluate(() => {
       const el = document.querySelector('button[data-cl-command="AddProfileLockCommand"]');
@@ -1660,13 +1439,12 @@ async function goPinAndAuth(page, settingsId, password, refererUrl) {
     if (!SUCCESS_RE.test(page.url())) return false;
   }
 
-  // Sau click: chờ Confirm(PASSWORD) HOẶC đã vào pinentry
-  const stage1Confirm = page.waitForSelector(CONFIRM_SEL, { visible: true, timeout: TIMEOUTS.first })
-    .then(() => 'confirm').catch(() => null);
-  const stage1Url = page.waitForFunction(
-    re => new RegExp(re,'i').test(location.href), { timeout: TIMEOUTS.first, polling: 300 }, SUCCESS_RE.source
-  ).then(ok => ok ? 'url' : null).catch(() => null);
-  const stage1 = await Promise.race([stage1Confirm, stage1Url]);
+  const stage1 = await Promise.race([
+    page.waitForSelector(CONFIRM_SEL, { visible: true, timeout: TIMEOUTS.first }).then(()=>'confirm').catch(()=>null),
+    page.waitForFunction(
+      re => new RegExp(re,'i').test(location.href), { timeout: TIMEOUTS.first, polling: 300 }, SUCCESS_RE.source
+    ).then(ok => ok ? 'url' : null).catch(() => null)
+  ]);
 
   if (stage1 === 'url') {
     console.log('✅ Vào pinentry ngay sau click.');
@@ -1678,18 +1456,17 @@ async function goPinAndAuth(page, settingsId, password, refererUrl) {
     return false;
   }
 
-  // Confirm → nhập pass hoặc redirect
   const confirmBtn = await page.$(CONFIRM_SEL);
   if (!confirmBtn) { console.log('❌ confirmBtn biến mất.'); return false; }
   await clickWithAllTricks(page, confirmBtn);
 
-  const stage2Input = page.waitForSelector(PASS_INPUT_SEL, { timeout: TIMEOUTS.input, visible: true })
-    .then(() => 'input').catch(() => null);
-  const stage2Url = page.waitForFunction(
-    re => new RegExp(re, 'i').test(location.href),
-    { timeout: TIMEOUTS.input, polling: 300 }, SUCCESS_RE.source
-  ).then(ok => ok ? 'url' : null).catch(() => null);
-  const stage2 = await Promise.race([stage2Input, stage2Url]);
+  const stage2 = await Promise.race([
+    page.waitForSelector(PASS_INPUT_SEL, { timeout: TIMEOUTS.input, visible: true }).then(()=> 'input').catch(()=>null),
+    page.waitForFunction(
+      re => new RegExp(re, 'i').test(location.href),
+      { timeout: TIMEOUTS.input, polling: 300 }, SUCCESS_RE.source
+    ).then(ok => ok ? 'url' : null).catch(()=>null)
+  ]);
 
   if (stage2 === 'url') {
     console.log('✅ Redirect pinentry sau confirm (không cần nhập pass).');
@@ -1700,7 +1477,6 @@ async function goPinAndAuth(page, settingsId, password, refererUrl) {
     return false;
   }
 
-  // Nhập mật khẩu + Enter
   console.log('👉 Nhập mật khẩu…');
   const passInput = await page.$(PASS_INPUT_SEL);
   if (!passInput) { console.log('❌ passInput biến mất.'); return false; }
@@ -1848,11 +1624,7 @@ async function setPinDigitsAndSave(page, pin4) {
 async function clickRemoveProfileLockButton(page) {
   const hit = await findButtonAnyFrame(
     page,
-    [
-      'button[data-uia="profile-lock-page+remove-button"]',
-      'button[data-uia="profile-lock-remove-button"]',
-      '[data-cl-command="RemoveProfileLockCommand"]',
-    ],
+    S.removeLockBtn,
     ['xóa', 'xoá', 'remove', 'disable', 'delete']
   );
   if (!hit) return false;
@@ -1874,16 +1646,9 @@ async function clickRemoveProfileLockButton(page) {
   }
 
   // Password in modal (optional)
-  const PASS_INPUT_CANDIDATES = [
-    '[data-uia="collect-password-input-modal-entry"]',
-    'input[name="password"]',
-    'input[type="password"]',
-    'input[autocomplete="current-password"]',
-    'input[autocomplete="password"]',
-  ];
   let passBox = null;
   for (let i = 0; i < 8 && !passBox; i++) {
-    for (const sel of PASS_INPUT_CANDIDATES) {
+    for (const sel of S.passInput) {
       const hitSel = await queryInAllFrames(page, sel);
       if (hitSel) { passBox = hitSel.handle; break; }
     }
@@ -1894,7 +1659,7 @@ async function clickRemoveProfileLockButton(page) {
     try { await page.keyboard.press('Enter'); } catch {}
   }
 
-  // Save/Done button (if UI requires)
+  // Save/Done (if any)
   for (let i = 0; i < 6; i++) {
     const saveBtn =
       await findButtonByTextAnyFrame(page, ['lưu','save','done','hoàn tất','update','cập nhật']) ||
@@ -1909,15 +1674,10 @@ async function clickRemoveProfileLockButton(page) {
   return true;
 }
 
-// ==== CHECK: có nút "Xóa/Xoá/Remove profile lock" không (trên mọi frame) ====
 async function hasRemoveButtonAnyFrame(page) {
   const found = await findButtonAnyFrame(
     page,
-    [
-      'button[data-uia="profile-lock-page+remove-button"]',
-      'button[data-uia="profile-lock-remove-button"]',
-      '[data-cl-command="RemoveProfileLockCommand"]',
-    ],
+    S.removeLockBtn,
     [
       'xóa khóa hồ sơ', 'xoá khóa hồ sơ', 'tắt khóa hồ sơ', 'bỏ khóa hồ sơ',
       'remove profile lock', 'disable profile lock', 'remove lock', 'delete profile lock',
@@ -1939,7 +1699,6 @@ async function disableProfileLockByRemove(page, settingsId, password, refererUrl
 
   const removedClicked = await clickRemoveProfileLockButton(page);
 
-  // Nếu Netflix hiện modal xác minh → xử lý
   await handleIdentityVerifyModal(page, password);
 
   if (!removedClicked) {
@@ -1960,35 +1719,30 @@ async function disableProfileLockByRemove(page, settingsId, password, refererUrl
     }
   }
 
-  // Nếu còn modal password → nhập & Enter (backup)
-  const PASS_INPUT_SEL = '[data-uia="collect-password-input-modal-entry"], input[name="password"], input[type="password"]';
+  const PASS_INPUT_SEL = S.passInput.join(',');
   const passField = await queryInAllFrames(page, PASS_INPUT_SEL);
   if (passField?.handle) {
     try { await passField.handle.type(password, { delay: 40 }); } catch {}
     try { await page.keyboard.press('Enter'); } catch {}
   }
 
-  // Ưu tiên xác nhận theo query param
- const paramOk = await waitForProfilePinDeletedSuccess(page, 15000);
- if (paramOk) return true;
+  const paramOk = await waitForProfilePinDeletedSuccess(page, 15000);
+  if (paramOk) return true;
 
-  // fallback: URL/Toast/Remove button biến mất
-  const ok = await Promise.race([
+  const ok = await raceAny(
     page.waitForFunction(() =>
       /\/settings\/lock(\/|$)/.test(location.pathname) && !/pinentry/.test(location.pathname),
-      { timeout: 15000 }).then(()=>true).catch(()=>false),
+      { timeout: 15000 }),
     page.waitForFunction(() =>
       /đã lưu|đã cập nhật|saved|updated|hoàn tất|done/i.test(document.body?.innerText||''),
-      { timeout: 15000 }).then(()=>true).catch(()=>false),
-    // có trường hợp điều hướng thẳng về /settings/<ID>?profilePinDeleted=success
+      { timeout: 15000 }),
     waitForProfilePinDeletedSuccess(page, 15000)
-  ]);
+  );
 
   await sleep(500);
   const stillHasRemove = await hasRemoveButtonAnyFrame(page);
   if (!(ok && !stillHasRemove)) return false;
 
-  // Nếu đang ở /settings/<ID>?profilePinDeleted=success → chuyển ngay sang /settings/lock/<ID>
   try {
     const href = page.url();
     const m = href.match(/\/settings\/([A-Z0-9]+)\b/i);
@@ -2002,6 +1756,7 @@ async function disableProfileLockByRemove(page, settingsId, password, refererUrl
 
   return true;
 }
+
 async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
   await hardGotoLock(page, settingsId, refererUrl);
 
@@ -2014,12 +1769,10 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
     }
     console.log('✅ Đã gỡ khóa hồ sơ thành công, chuyển sang tạo PIN mới…');
 
-    // Cập nhật referer + chắc chắn đứng ở trang lock/<ID>
     try { refererUrl = page.url(); } catch {}
     await hardGotoLock(page, settingsId, refererUrl);
   }
 
-  // Vào pinentry (Confirm with password nếu cần) rồi set PIN
   const ok = await goPinAndAuth(page, settingsId, password, refererUrl);
   if (!ok) {
     console.log('❌ Không vào được pinentry sau khi gỡ/hoặc chưa bật.');
@@ -2028,7 +1781,6 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
 
   return await setPinDigitsAndSave(page, newPin);
 }
-
 
 /* ============== MAIN ============== */
 (async () => {
@@ -2053,6 +1805,12 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
     });
 
     page = await browser.newPage();
+    // Stealth
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN','vi','en-US','en'] });
+      Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    });
     page.setDefaultTimeout(30000);
     page.setDefaultNavigationTimeout(60000);
 
@@ -2076,51 +1834,49 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
       const ok = await loginWithCredentials(page, NETFLIX_EMAIL, NETFLIX_PASSWORD);
       if (!ok) {
         console.log('❌ Không đăng nhập được bằng tài khoản/mật khẩu.');
-        await new Promise(() => {}); // treo để xem UI
+        await holdOrExit(1);
         return;
       }
       loggedIn = true;
     }
+
     // ==== ACTION: add (tạo hồ sơ mới) ====
-// Cú pháp: node loginByCookie.js add "Tên hồ sơ" [PIN4] [kids]
-const action0 = (process.argv[2] || '').trim().toLowerCase();
-if (action0 === 'add') {
-  const newName  = process.argv[3] || '';
-  const maybePin = process.argv[4] || '';
-  const kidsFlag = (process.argv[5] || '').toLowerCase();
-  const isKids   = ['kids','kid','child','children','tre','trẻ','treem','trẻ em','te'].includes(kidsFlag);
+    // Cú pháp: node loginByCookie.js add "Tên hồ sơ" [PIN4] [kids]
+    const action0 = (process.argv[2] || '').trim().toLowerCase();
+    if (action0 === 'add') {
+      const newName  = process.argv[3] || '';
+      const maybePin = process.argv[4] || '';
+      const kidsFlag = (process.argv[5] || '').toLowerCase();
+      const isKids   = ['kids','kid','child','children','tre','trẻ','treem','trẻ em','te'].includes(kidsFlag);
 
-  if (!newName) {
-    console.log('❌ Thiếu tên hồ sơ. Dùng: node loginByCookie.js add "Tên hồ sơ" [PIN4] [kids]');
-    await new Promise(()=>{});
-    return;
-  }
+      if (!newName) {
+        console.log('❌ Thiếu tên hồ sơ. Dùng: node loginByCookie.js add "Tên hồ sơ" [PIN4] [kids]');
+        await holdOrExit(1);
+        return;
+      }
 
-  // đảm bảo đang ở profiles
-  await page.goto('https://www.netflix.com/account/profiles', { waitUntil:'networkidle2', timeout:60000 }).catch(()=>{});
+      await page.goto('https://www.netflix.com/account/profiles', { waitUntil:'networkidle2', timeout:60000 }).catch(()=>{});
 
-  const { ok, settingsId } = await addProfile(page, newName, { isKids });
-  if (!ok) {
-    console.log('❌ Tạo hồ sơ thất bại.');
-    await new Promise(()=>{});
-    return;
-  }
-  console.log('✅ Đã tạo hồ sơ mới:', newName, '→ settingsId:', settingsId || '(chưa lấy được)');
+      const { ok, settingsId } = await addProfile(page, newName, { isKids });
+      if (!ok) {
+        console.log('❌ Tạo hồ sơ thất bại.');
+        await holdOrExit(1);
+        return;
+      }
+      console.log('✅ Đã tạo hồ sơ mới:', newName, '→ settingsId:', settingsId || '(chưa lấy được)');
 
-  // Nếu có PIN 4 số → đặt ngay
-  if (/^\d{4}$/.test(maybePin) && settingsId) {
-    console.log('🔐 Đặt PIN cho hồ sơ mới…');
-    const okPin = await setPinSmart(page, settingsId, HARDCODED_PASSWORD, maybePin, page.url());
-    if (!okPin) console.log('⚠️ Không đặt được PIN cho hồ sơ mới.');
-    else console.log('✅ Đã đặt PIN thành công cho hồ sơ mới.');
-  } else if (maybePin) {
-    console.log('ℹ️ Bỏ qua đặt PIN: Giá trị PIN không hợp lệ (cần 4 chữ số).');
-  }
+      if (/^\d{4}$/.test(maybePin) && settingsId) {
+        console.log('🔐 Đặt PIN cho hồ sơ mới…');
+        const okPin = await setPinSmart(page, settingsId, HARDCODED_PASSWORD, maybePin, page.url());
+        if (!okPin) console.log('⚠️ Không đặt được PIN cho hồ sơ mới.');
+        else console.log('✅ Đã đặt PIN thành công cho hồ sơ mới.');
+      } else if (maybePin) {
+        console.log('ℹ️ Bỏ qua đặt PIN: Giá trị PIN không hợp lệ (cần 4 chữ số).');
+      }
 
-  await new Promise(()=>{});
-  return;
-}
-
+      await holdOrExit(0);
+      return;
+    }
 
     // Lấy settingsId
     let settingsId = null;
@@ -2137,73 +1893,73 @@ if (action0 === 'add') {
         const names = await getProfileNames(page);
         console.log('🔎 Hồ sơ phát hiện:', names);
         console.log('➡️  Dùng: node loginByCookie.js "Tên hồ sơ" 1234  HOẶC  node loginByCookie.js SETTINGS_ID 1234');
-        await new Promise(() => {}); // treo để bạn đọc log
+        await holdOrExit(0);
         return;
       }
       const names = await getProfileNames(page);
       if (!names.includes(arg)) {
         console.log(`❌ Không tìm thấy hồ sơ tên "${arg}". Danh sách:`, names);
-        await new Promise(() => {});
+        await holdOrExit(1);
         return;
       }
       const res = await openProfileAndGetId(page, arg, 5);
-      if (!res) { console.log('❌ Không lấy được settingsId.'); await new Promise(() => {}); return; }
+      if (!res) { console.log('❌ Không lấy được settingsId.'); await holdOrExit(1); return; }
       settingsId = res.id;
       refererUrl = res.settingsUrl;
     }
 
-// ==== Action routing: delete | set-pin (4 digits) | just open ====
-const rawArg = (process.argv[3] || process.env.PIN || '').trim();
-const action = rawArg.toLowerCase();
-const isFourDigits = /^\d{4}$/.test(rawArg);
+    // ==== Action routing: delete | set-pin (4 digits) | just open ====
+    const rawArg = (process.argv[3] || process.env.PIN || '').trim();
+    const action = rawArg.toLowerCase();
+    const isFourDigits = /^\d{4}$/.test(rawArg);
 
-if (action === 'delete' || process.env.DELETE_PROFILE === '1') {
-  const profileName = (arg && !/^[A-Z0-9]+$/.test(arg)) ? arg : null;
-  const okDel = await deleteProfileBySettingsId(page, settingsId, HARDCODED_PASSWORD, refererUrl, profileName);
+    if (action === 'delete' || process.env.DELETE_PROFILE === '1') {
+      const profileName = (arg && !/^[A-Z0-9]+$/.test(arg)) ? arg : null;
+      const okDel = await deleteProfileBySettingsId(page, settingsId, HARDCODED_PASSWORD, refererUrl, profileName);
 
-  if (okDel) {
-    try { await page.goto('https://www.netflix.com/account/profiles', { waitUntil:'networkidle2', timeout:20000 }); } catch {}
-    console.log('✅ Xóa xong – đang ở danh sách hồ sơ.');
-  } else {
-    console.log('⚠️ Xóa không thành công – giữ nguyên trang hiện tại để kiểm tra.');
-  }
-  await new Promise(()=>{});
-  return;
-}
+      if (okDel) {
+        try { await page.goto('https://www.netflix.com/account/profiles', { waitUntil:'networkidle2', timeout:20000 }); } catch {}
+        console.log('✅ Xóa xong – đang ở danh sách hồ sơ.');
+        await holdOrExit(0);
+      } else {
+        console.log('⚠️ Xóa không thành công – giữ nguyên trang hiện tại để kiểm tra.');
+        await holdOrExit(1);
+      }
+      return;
+    }
 
-if (isFourDigits) {
-  const okPin = await setPinSmart(page, settingsId, HARDCODED_PASSWORD, rawArg, refererUrl);
-  if (!okPin) console.log('❌ Không thay/đặt được PIN. Xem log ở trên.');
-  await new Promise(() => {}); 
-  return;
-}
+    if (isFourDigits) {
+      const okPin = await setPinSmart(page, settingsId, HARDCODED_PASSWORD, rawArg, refererUrl);
+      if (!okPin) console.log('❌ Không thay/đặt được PIN. Xem log ở trên.');
+      await holdOrExit(okPin ? 0 : 1);
+      return;
+    }
 
-// Không truyền gì → chỉ mở trang khóa hồ sơ
-await hardGotoLock(page, settingsId, refererUrl);
-console.log('ℹ️ Không truyền PIN hoặc delete → chỉ mở trang khóa hồ sơ.');
-await new Promise(() => {});
-return;
+    // Không truyền gì → chỉ mở trang khóa hồ sơ
+    await hardGotoLock(page, settingsId, refererUrl);
+    console.log('ℹ️ Không truyền PIN hoặc delete → chỉ mở trang khóa hồ sơ.');
+    await holdOrExit(0);
+    return;
 
   } catch (err) {
-  if (isBenignNavError(err)) {
-    // Nếu đã ở trang xác nhận xóa thành công thì im lặng thoát
-    try {
-      const href = page?.url?.() || '';
-      if (/\/account\/profiles\b/i.test(href)) {
-        const okParam = /[?&]profileDeleted=success\b/i.test(href);
-        if (okParam) {
-          console.log('✅ Xóa hồ sơ thành công (đã về profiles?profileDeleted=success).');
-          return; // KHÔNG in cảnh báo nữa
+    if (isBenignNavError(err)) {
+      try {
+        const href = page?.url?.() || '';
+        if (/\/account\/profiles\b/i.test(href)) {
+          const okParam = /[?&]profileDeleted=success\b/i.test(href);
+          if (okParam) {
+            console.log('✅ Xóa hồ sơ thành công (đã về profiles?profileDeleted=success).');
+            await holdOrExit(0);
+            return;
+          }
         }
-      }
-    } catch {}
+      } catch {}
 
-    // Nếu chưa chắc chắn là thành công, vẫn in cảnh báo và giữ trình duyệt mở
-    console.warn('⚠️ Bỏ qua lỗi do điều hướng:', err.message);
-    await new Promise(() => {}); // giữ trình duyệt mở để kiểm tra
-    return;
+      console.warn('⚠️ Bỏ qua lỗi do điều hướng:', err.message);
+      await holdOrExit(0);
+      return;
+    }
+    console.error('❌ Lỗi ngoài ý muốn:', err);
+    await cleanup(1);
   }
-  console.error('❌ Lỗi ngoài ý muốn:', err);
-  await cleanup(1);
-}
-})(); // <- ĐÓNG IIFE Ở ĐÂY
+})();
