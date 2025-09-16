@@ -1,4 +1,4 @@
-// loginByCookie.js (ESM)
+﻿// loginByCookie.js (ESM)
 // Flow:
 // 1) Đọc .env (NETFLIX_EMAIL, NETFLIX_PASSWORD, COOKIE_FILE)
 // 2) Thử login bằng cookies -> nếu fail thì login bằng tài khoản/mật khẩu và TỰ LƯU cookies
@@ -175,9 +175,8 @@ async function loginWithCredentials(page, email, password) {
 
   const btn = await page.$(btnSel);
   if (btn) { try { await btn.click({ delay: 20 }); } catch {} } else { await page.keyboard.press('Enter'); }
-
-  const ok = await Promise.race([
-    page.waitForFunction(() => /\/(browse|profiles|account)/i.test(location.pathname), { timeout: 30000 }).then(()=>true).catch(()=>false),
+const ok = await Promise.race([
+  page.waitForFunction(() => /\/(browse|profiles|account)/i.test(location.pathname), { timeout: 30000 }).then(()=>true).catch(()=>false),
     page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).then(()=>/\/(browse|profiles|account)/i.test(page.url())).catch(()=>false),
   ]);
 
@@ -626,6 +625,26 @@ async function waitForProfileDeletedSuccess(page, timeout = 15000) {
     .then(() => true)
     .catch(() => false);
 }
+// Đợi tín hiệu đã gỡ khóa hồ sơ thành công (ở /settings/<ID> hoặc /account/profiles)
+async function waitForProfilePinDeletedSuccess(page, timeout = 15000) {
+  return await page
+    .waitForFunction(() => {
+      try {
+        const u = new URL(location.href);
+        const ok =
+          u.searchParams.get('profilePinDeleted') === 'success' ||
+          u.searchParams.get('profileLockRemoved') === 'true' ||
+          u.searchParams.get('profileLock') === 'removed' ||
+          u.searchParams.get('pinDeleted') === 'success';
+        const onSettings = /\/settings\/[A-Z0-9]+/i.test(u.pathname);
+        const onProfiles = /\/account\/profiles/i.test(u.pathname);
+        return ok && (onSettings || onProfiles);
+      } catch { return false; }
+    }, { timeout })
+    .then(() => true)
+    .catch(() => false);
+}
+
 
 // Click "Tạo khóa hồ sơ" trong mọi frame
 async function clickCreateProfileLockAnyFrame(page) {
@@ -1108,10 +1127,9 @@ async function deleteProfileBySettingsId(
     return false;
   }
 
-  // 1) Click nút “Xóa hồ sơ” để mở overlay
+// 1) Click nút “Xóa hồ sơ” để mở overlay (dùng bản global)
 console.log('🗑️ Tìm & bấm nút "Xóa hồ sơ"…');
-const ok1 = await safeRun(() => clickDeleteProfileButtonStrict(), false);
-if (!ok1) { console.log('❌ Không click được nút "Xóa hồ sơ".'); return false; }
+const ok1 = await safeRun(() => clickDeleteProfileButtonStrict(page, { retry: 3 }), false);
 await safeRun(() => Promise.race([
   page.waitForFunction(() =>
     !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]')),
@@ -1128,7 +1146,7 @@ await safeRun(() => Promise.race([
   ).then(() => true).catch(() => false);
   if (!overlayOk) {
     console.log('⚠️ Overlay xác nhận không hiện. Thử click lại…');
-    if (!await clickDeleteProfileButtonStrict()) {
+    if (!await clickDeleteProfileButtonStrict(page, { retry: 2 })) {
       console.log('❌ Không mở được overlay xác nhận.');
       return false;
     }
@@ -1607,8 +1625,8 @@ async function disableProfileLockByRemove(page, settingsId, password, refererUrl
   }
 
   // Ưu tiên xác nhận theo query param
-  const paramOk = await waitForProfilePinDeletedSuccess(page, 15000);
-  if (paramOk) return true;
+ const paramOk = await waitForProfilePinDeletedSuccess(page, 15000);
+ if (paramOk) return true;
 
   // fallback: URL/Toast/Remove button biến mất
   const ok = await Promise.race([
@@ -1618,14 +1636,28 @@ async function disableProfileLockByRemove(page, settingsId, password, refererUrl
     page.waitForFunction(() =>
       /đã lưu|đã cập nhật|saved|updated|hoàn tất|done/i.test(document.body?.innerText||''),
       { timeout: 15000 }).then(()=>true).catch(()=>false),
+    // có trường hợp điều hướng thẳng về /settings/<ID>?profilePinDeleted=success
+    waitForProfilePinDeletedSuccess(page, 15000)
   ]);
 
   await sleep(500);
   const stillHasRemove = await hasRemoveButtonAnyFrame(page);
-  return (ok && !stillHasRemove);
-}
+  if (!(ok && !stillHasRemove)) return false;
 
-/* ============== ĐẶT PIN thông minh (gỡ trước nếu đã có) ============== */
+  // Nếu đang ở /settings/<ID>?profilePinDeleted=success → chuyển ngay sang /settings/lock/<ID>
+  try {
+    const href = page.url();
+    const m = href.match(/\/settings\/([A-Z0-9]+)\b/i);
+    if (m && /profilePinDeleted=success/i.test(href)) {
+      const sid = m[1];
+      await page.goto(`https://www.netflix.com/settings/lock/${sid}`, {
+        waitUntil: 'networkidle2', timeout: 20000
+      }).catch(()=>{});
+    }
+  } catch {}
+
+  return true;
+}
 async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
   await hardGotoLock(page, settingsId, refererUrl);
 
@@ -1637,8 +1669,13 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
       return false;
     }
     console.log('✅ Đã gỡ khóa hồ sơ thành công, chuyển sang tạo PIN mới…');
+
+    // Cập nhật referer + chắc chắn đứng ở trang lock/<ID>
+    try { refererUrl = page.url(); } catch {}
+    await hardGotoLock(page, settingsId, refererUrl);
   }
 
+  // Vào pinentry (Confirm with password nếu cần) rồi set PIN
   const ok = await goPinAndAuth(page, settingsId, password, refererUrl);
   if (!ok) {
     console.log('❌ Không vào được pinentry sau khi gỡ/hoặc chưa bật.');
@@ -1647,6 +1684,7 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
 
   return await setPinDigitsAndSave(page, newPin);
 }
+
 
 /* ============== MAIN ============== */
 (async () => {
