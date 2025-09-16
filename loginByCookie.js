@@ -296,6 +296,173 @@ async function openProfileAndGetId(page, profileName, retries = 5) {
 }
 
 /* ============== Click helpers ============== */
+// ====== Add Profile (Thêm hồ sơ) ======
+async function clickAddProfileButton(page, { timeoutMs = 8000 } = {}) {
+  const SELECTORS = [
+    'button[data-uia="menu-card+button"][data-cl-view="addProfile"]',
+    'button[data-cl-view="addProfile"]',
+    '[data-uia="add-profile-button"]',
+  ];
+  const KEYWORDS = ['thêm hồ sơ', 'them ho so', 'add profile', 'new profile'];
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // ưu tiên selector cứng
+    for (const sel of SELECTORS) {
+      const hit = await queryInAllFrames(page, sel);
+      if (hit?.handle) {
+        await robustClickHandle(page, hit.handle);
+        return true;
+      }
+    }
+    // fallback theo text
+    const byText = await findButtonByTextAnyFrame(page, KEYWORDS);
+    if (byText?.handle) {
+      await robustClickHandle(page, byText.handle);
+      return true;
+    }
+    await sleep(200);
+  }
+  return false;
+}
+
+async function waitForAddProfileModal(page, { timeoutMs = 8000 } = {}) {
+  return await page
+    .waitForFunction(() =>
+      !!(document.querySelector('div[role="dialog"]') || document.querySelector('[data-uia="modal"]')),
+      { timeout: timeoutMs }
+    )
+    .then(() => true)
+    .catch(() => false);
+}
+
+async function typeNewProfileName(page, name) {
+  const INPUTS = [
+    'div[role="dialog"] input[name="profileName"]',
+    'div[role="dialog"] input[type="text"]',
+    'div[role="dialog"] input',
+    '[data-uia="modal"] input[name="profileName"]',
+    '[data-uia="modal"] input[type="text"]',
+    '[data-uia="modal"] input',
+  ];
+  for (const sel of INPUTS) {
+    const hit = await queryInAllFrames(page, sel);
+    if (hit?.handle) {
+      try { await hit.frame.evaluate(el => el.focus(), hit.handle); } catch {}
+      try { await hit.handle.click({ clickCount: 3 }); } catch {}
+      try { await hit.handle.type(name, { delay: 40 }); } catch {}
+      return true;
+    }
+  }
+  return false;
+}
+
+async function setKidsToggleIfNeeded(page, isKids=false) {
+  const TOGGLE_CANDIDATES = [
+    'div[role="dialog"] [data-uia*="kids" i]',
+    'div[role="dialog"] [aria-label*="trẻ" i], div[role="dialog"] [aria-label*="kids" i]',
+    'div[role="dialog"] input[type="checkbox"]',
+  ];
+  // nếu không yêu cầu thì bỏ qua
+  if (typeof isKids !== 'boolean') return true;
+
+  for (const sel of TOGGLE_CANDIDATES) {
+    const hit = await queryInAllFrames(page, sel);
+    if (hit?.handle) {
+      // đọc trạng thái nếu là input checkbox
+      const state = await hit.frame.evaluate(el => {
+        if (el.tagName === 'INPUT' && el.type === 'checkbox') return el.checked;
+        // với nút gạt custom, thử nhìn aria-pressed/aria-checked
+        const pressed = el.getAttribute('aria-pressed');
+        const checked = el.getAttribute('aria-checked');
+        if (pressed != null) return pressed === 'true';
+        if (checked != null) return checked === 'true';
+        return null; // không xác định
+      }, hit.handle).catch(()=>null);
+
+      // nếu không xác định, cứ bỏ qua để tránh click sai
+      if (state === null) return true;
+
+      if (state !== isKids) {
+        await robustClickHandle(page, hit.handle);
+      }
+      return true;
+    }
+  }
+  return true;
+}
+
+async function clickSaveNewProfile(page) {
+  const SAVE_CANDIDATES = [
+    'div[role="dialog"] button[data-uia*="save" i]',
+    'div[role="dialog"] button[type="submit"]',
+  ];
+  for (const sel of SAVE_CANDIDATES) {
+    const hit = await queryInAllFrames(page, sel);
+    if (hit?.handle) { await robustClickHandle(page, hit.handle); return true; }
+  }
+  const byText = await findButtonByTextAnyFrame(page, ['lưu','save','create','tạo']);
+  if (byText?.handle) { await robustClickHandle(page, byText.handle); return true; }
+  return false;
+}
+
+/**
+ * Tạo hồ sơ mới. Trả về { ok, settingsId }.
+ * Nếu tạo xong, sẽ mở luôn trang /settings/<ID> để bạn dễ thao tác tiếp.
+ */
+async function addProfile(page, name, { isKids = false } = {}) {
+  if (!name || !name.trim()) { console.log('❌ Thiếu tên hồ sơ.'); return { ok:false, settingsId:null }; }
+
+  // 1) Tới trang danh sách hồ sơ
+  await page.goto('https://www.netflix.com/account/profiles', { waitUntil: 'networkidle2', timeout: 60000 }).catch(()=>{});
+  await gentleReveal(page);
+
+  // 2) Bấm "Thêm hồ sơ"
+  console.log('➕ Mở modal "Thêm hồ sơ"…');
+  const opened = await clickAddProfileButton(page);
+  if (!opened) { console.log('❌ Không bấm được "Thêm hồ sơ".'); return { ok:false, settingsId:null }; }
+
+  // 3) Chờ modal & nhập tên
+  const hasModal = await waitForAddProfileModal(page);
+  if (!hasModal) { console.log('❌ Modal "Thêm hồ sơ" không xuất hiện.'); return { ok:false, settingsId:null }; }
+
+  const typed = await typeNewProfileName(page, name.trim());
+  if (!typed) { console.log('❌ Không nhập được tên hồ sơ.'); return { ok:false, settingsId:null }; }
+
+  // 4) Kids (tuỳ chọn)
+  await setKidsToggleIfNeeded(page, isKids);
+
+  // 5) Lưu
+  const saved = await clickSaveNewProfile(page);
+  if (!saved) { console.log('❌ Không bấm được nút Lưu.'); return { ok:false, settingsId:null }; }
+
+  // 6) Đợi modal đóng / danh sách cập nhật
+  await Promise.race([
+    page.waitForFunction(() => !document.querySelector('div[role="dialog"]') && !document.querySelector('[data-uia="modal"]'), { timeout: 8000 }).catch(()=>null),
+    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(()=>null),
+  ]);
+
+  // 7) Xác nhận tên xuất hiện trong danh sách + lấy settingsId
+  await page.goto('https://www.netflix.com/account/profiles', { waitUntil: 'networkidle2', timeout: 30000 }).catch(()=>{});
+  await gentleReveal(page);
+  const names = await getProfileNames(page);
+  if (!names.includes(name)) {
+    console.log('⚠️ Không thấy hồ sơ vừa tạo trong danh sách. Danh sách:', names);
+    // vẫn thử mở nếu Netflix lazy-update UI
+  }
+
+  // Mở chính hồ sơ mới để lấy settingsId
+  const openedProfile = await openProfileAndGetId(page, name, 5);
+  if (!openedProfile) {
+    console.log('⚠️ Tạo có vẻ OK nhưng không lấy được settingsId.');
+    return { ok: true, settingsId: null };
+  }
+
+  // Đứng lại ở trang /settings/<ID> để tiện làm tiếp (đặt PIN…)
+  await hardGotoSettings(page, openedProfile.id, openedProfile.settingsUrl);
+  return { ok: true, settingsId: openedProfile.id };
+}
+
 async function clickWithAllTricks(page, handle) {
   try { await page.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' }), handle); } catch {}
   try { await page.evaluate(el => el.click(), handle); return true; } catch {}
@@ -1737,6 +1904,46 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
       }
       loggedIn = true;
     }
+    // ==== ACTION: add (tạo hồ sơ mới) ====
+// Cú pháp: node loginByCookie.js add "Tên hồ sơ" [PIN4] [kids]
+const action0 = (process.argv[2] || '').trim().toLowerCase();
+if (action0 === 'add') {
+  const newName  = process.argv[3] || '';
+  const maybePin = process.argv[4] || '';
+  const kidsFlag = (process.argv[5] || '').toLowerCase();
+  const isKids   = ['kids','kid','child','children','tre','trẻ','treem','trẻ em','te'].includes(kidsFlag);
+
+  if (!newName) {
+    console.log('❌ Thiếu tên hồ sơ. Dùng: node loginByCookie.js add "Tên hồ sơ" [PIN4] [kids]');
+    await new Promise(()=>{});
+    return;
+  }
+
+  // đảm bảo đang ở profiles
+  await page.goto('https://www.netflix.com/account/profiles', { waitUntil:'networkidle2', timeout:60000 }).catch(()=>{});
+
+  const { ok, settingsId } = await addProfile(page, newName, { isKids });
+  if (!ok) {
+    console.log('❌ Tạo hồ sơ thất bại.');
+    await new Promise(()=>{});
+    return;
+  }
+  console.log('✅ Đã tạo hồ sơ mới:', newName, '→ settingsId:', settingsId || '(chưa lấy được)');
+
+  // Nếu có PIN 4 số → đặt ngay
+  if (/^\d{4}$/.test(maybePin) && settingsId) {
+    console.log('🔐 Đặt PIN cho hồ sơ mới…');
+    const okPin = await setPinSmart(page, settingsId, HARDCODED_PASSWORD, maybePin, page.url());
+    if (!okPin) console.log('⚠️ Không đặt được PIN cho hồ sơ mới.');
+    else console.log('✅ Đã đặt PIN thành công cho hồ sơ mới.');
+  } else if (maybePin) {
+    console.log('ℹ️ Bỏ qua đặt PIN: Giá trị PIN không hợp lệ (cần 4 chữ số).');
+  }
+
+  await new Promise(()=>{});
+  return;
+}
+
 
     // Lấy settingsId
     let settingsId = null;
