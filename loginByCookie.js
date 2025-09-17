@@ -22,6 +22,8 @@ const HOLD = process.argv.includes('--hold');
 /* ====== Graceful shutdown ====== */
 let browser; // để cleanup dùng được
 let page;
+let __AUTO_FLOW = false;
+
 
 async function cleanup(exitCode = 0) {
   try { await page?.close().catch(() => {}); } catch {}
@@ -55,8 +57,9 @@ async function raceAny(...promises) {
 }
 function isBenignNavError(err) {
   const msg = String(err?.message || err);
-  return /Execution context was destroyed|Cannot find context|Target closed|frame got detached/i.test(msg);
+  return /Execution context was destroyed|Cannot find context|Target closed|frame got detached|detached frame|Frame was detached/i.test(msg);
 }
+
 // ===== SELECTORS MAP =====
 const S = {
   addProfile: [
@@ -93,6 +96,90 @@ const S = {
     'input[autocomplete="current-password"]', 'input[autocomplete="password"]',
   ],
 };
+/* ====== Name Normalization (trim/lowercase/remove accents/collapse spaces) ====== */
+function normalizeName(s) {
+  if (!s) return '';
+  return s
+    .normalize('NFD')                      // tách dấu
+    .replace(/[\u0300-\u036f]/g, '')      // bỏ dấu
+    .toLowerCase()
+    .replace(/\s+/g, ' ')                 // gộp space
+    .trim();
+}
+
+/* ====== DB: đọc danh sách hồ sơ & ngày hết hạn ====== */
+const PROFILE_DB_FILE = process.env.PROFILE_DB_FILE || './profiles.db.json';
+
+function loadProfileDb(file = PROFILE_DB_FILE) {
+  try {
+    const raw = fs.readFileSync(file, 'utf-8');
+    const arr = JSON.parse(raw);
+    const map = new Map();
+    for (const r of arr) {
+      const name = String(r.name || '').trim();
+      if (!name) continue;
+      const d = r.expiresAt ? new Date(r.expiresAt) : null;
+      map.set(name, d && !isNaN(+d) ? d : null);
+    }
+    return map;
+  } catch {
+    console.log(`⚠️ Không đọc được ${file}. Sẽ coi như DB rỗng.`);
+    return new Map();
+  }
+}
+
+function isExpired(expiresAt, now = new Date(), graceDays = 0) {
+  if (!expiresAt) return false;
+  const end = new Date(expiresAt);
+  end.setHours(23, 59, 59, 999);
+  if (graceDays > 0) {
+    const threshold = new Date(now);
+    threshold.setDate(threshold.getDate() + graceDays);
+    return end < threshold; // sắp/đã hết hạn
+  }
+  return now > end; // hết hạn thực sự
+}
+
+/**
+ * Chọn nạn nhân để xoá theo luật:
+ * - Ưu tiên: preferredVictim (nếu khớp tên)
+ * - Tiếp: tên không có trong DB
+ * - Tiếp: hồ sơ hết hạn/sắp hết hạn (graceDays)
+ * - Nếu forceOldest: chọn expiresAt sớm nhất
+ */
+function pickEvictionCandidate(uiNames = [], dbMap = new Map(), opts = {}) {
+  const { graceDays = 0, forceOldest = false, preferredVictim = null } = opts;
+
+  if (preferredVictim && uiNames.includes(preferredVictim)) return preferredVictim;
+
+  const unknown = uiNames.find(n => !dbMap.has(n));
+  if (unknown) return unknown;
+
+  let expiredBest = null;
+  let expiredBestDate = null;
+  for (const n of uiNames) {
+    const exp = dbMap.get(n);
+    if (exp && isExpired(exp, new Date(), graceDays)) {
+      if (!expiredBestDate || exp < expiredBestDate) {
+        expiredBest = n; expiredBestDate = exp;
+      }
+    }
+  }
+  if (expiredBest) return expiredBest;
+
+  if (forceOldest) {
+    let oldest = null, oldestDate = null;
+    for (const n of uiNames) {
+      const exp = dbMap.get(n);
+      if (exp && (!oldestDate || exp < oldestDate)) {
+        oldest = n; oldestDate = exp;
+      }
+    }
+    if (oldest) return oldest;
+  }
+
+  return null;
+}
 
 // ===== Cache frame dialog để giảm quét =====
 let __dialogFrameCache = { ts: 0, frame: null };
@@ -1012,30 +1099,50 @@ async function findDeleteProfileButtonAnyFrame(page) {
 
 // ==== Nếu hiện dialog/sheet xác nhận thì tick checkbox & bấm xác nhận ====
 async function clickConfirmDeleteDialogsIfAny(page) {
-  const checkSel = [
+  // luôn clear cache frame dialog trước khi thao tác
+  __dialogFrameCache = { ts: 0, frame: null };
+
+  // tick checkbox nếu có
+  for (const sel of [
     'div[role="dialog"] input[type="checkbox"]',
     '[data-uia="modal"] input[type="checkbox"]',
-    'div[role="dialog"] [role="checkbox"]',
-  ];
-  for (const sel of checkSel) {
-    for (const f of page.frames()) {
-      const boxes = await f.$$(sel);
-      for (const b of boxes) {
-        try {
-          await f.evaluate(el => {
+    'div[role="dialog"] [role="checkbox"]'
+  ]) {
+    try {
+      const f = await getDialogFrame(page, 0);
+      if (f) {
+        const boxes = await f.$$(sel).catch(() => []);
+        for (const b of boxes) {
+          await safeRun(() => f.evaluate(el => {
             if (el.getAttribute?.('aria-checked') === 'false') el.click();
             if (el instanceof HTMLInputElement && !el.checked) el.click();
-          }, b);
-        } catch {}
+          }, b));
+        }
       }
-    }
+    } catch {}
   }
 
-  const confirm =
-    await findButtonByTextAnyFrame(page, ['xóa hồ sơ','xoá hồ sơ','delete','ok','confirm','yes','có']) ||
-    await findFirstVisibleInFrames(page, ['div[role="dialog"] button','[data-uia="modal"] button']);
-  if (confirm?.handle) await robustClickHandle(page, confirm.handle);
+  // tìm & click nút xác nhận
+  const findAndClick = async () => {
+    const hit =
+      await findButtonByTextAnyFrame(page, ['xóa hồ sơ','xoá hồ sơ','delete profile','delete','ok','confirm','yes','có']) ||
+      await findFirstVisibleInFrames(page, ['div[role="dialog"] button','[data-uia="modal"] button']);
+    if (hit?.handle) {
+      await safeRun(() => robustClickHandle(page, hit.handle));
+      return true;
+    }
+    return false;
+  };
+
+  for (let i = 0; i < 5; i++) {
+    const ok = await findAndClick();
+    if (ok) return true;
+    await sleep(150);
+    __dialogFrameCache = { ts: 0, frame: null };
+  }
+  return false;
 }
+
 
 async function singleClick(page, handle) {
   try { await page.evaluate(el => el.scrollIntoView({block:'center',inline:'center'}), handle); } catch {}
@@ -1289,6 +1396,14 @@ async function deleteProfileBySettingsId(
 
   console.log('🗑️ Bấm "Xóa hồ sơ" trong modal xác nhận…');
   const ok2 = await safeRun(() => clickSecondDeleteButton(page, { timeoutMs: 6000 }), false);
+  // KHÔNG giữ handle cũ: modal có thể detach frame → luôn bọc safeRun
+__dialogFrameCache = { ts: 0, frame: null };
+
+await safeRun(() => typeProfileNameInConfirmDialog(page, profileNameForConfirm), false);
+await safeRun(() => clickConfirmDeleteDialogsIfAny(page), false);
+await safeRun(() => confirmDangerInDialog(page), false);
+await safeRun(() => handleIdentityVerifyModal(page, password), false);
+
   if (!ok2) {
     await closeOverlaysIfAny(page);
     const retry = await safeRun(() => clickSecondDeleteButton(page, { timeoutMs: 6000 }), false);
@@ -1781,6 +1896,125 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
 
   return await setPinDigitsAndSave(page, newPin);
 }
+/**
+ * AUTO PROVISION:
+ *  B1: Nếu còn nút "Thêm hồ sơ" → tạo hồ sơ + PIN theo yêu cầu
+ *  B2: Nếu đủ 5 hồ sơ → tìm hồ sơ hết hạn / không có trong DB (hoặc theo flags) để xoá
+ *      rồi tạo hồ sơ mới + đặt PIN
+ */
+async function autoProvisionProfile(page, wantedName, pin4, { isKids = false } = {}) {
+  if (!wantedName || !/^\d{4}$/.test(pin4)) {
+    console.log('❌ Thiếu tên hồ sơ hoặc PIN (4 số).');
+    return false;
+  }
+
+  await page.goto('https://www.netflix.com/account/profiles',
+                  { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+  await gentleReveal(page);
+
+  // B1: còn nút "Thêm hồ sơ"?
+  const canAdd = !!(
+    await queryInAllFrames(page, S.addProfile[0]) ||
+    await queryInAllFrames(page, S.addProfile[1]) ||
+    await queryInAllFrames(page, S.addProfile[2]) ||
+    await findButtonByTextAnyFrame(page, ['thêm hồ sơ','them ho so','add profile','new profile'])
+  );
+
+  if (canAdd) {
+    console.log('🟢 Còn slot → tạo hồ sơ mới...');
+    const { ok, settingsId } = await addProfile(page, wantedName, { isKids });
+    if (!ok) return false;
+    console.log('✅ Đã tạo hồ sơ mới:', wantedName);
+    if (settingsId) {
+      console.log('🔐 Đặt PIN…');
+      return await setPinSmart(page, settingsId, HARDCODED_PASSWORD, pin4, page.url());
+    }
+    return true;
+  }
+
+  // B2: full slot → tìm ứng viên xoá
+  console.log('🟡 Hết slot → tìm hồ sơ để thay thế...');
+  const uiNames = await getProfileNames(page);
+  const top5    = uiNames.slice(0, 5);
+  const dbMap   = loadProfileDb();
+
+  // Log chẩn đoán
+  console.log('📋 UI top5:', top5);
+  const dbg = [];
+  for (const [k, v] of dbMap.entries()) dbg.push(`${k} -> ${v ? v.toISOString().slice(0,10) : '-'}`);
+  console.log('🗃️ DB keys:', dbg);
+
+  // Flags từ ENV (được set ở MAIN khi parse args)
+  const graceDays   = Number(process.env.GRACE_DAYS || 0) || 0;
+  const forceOldest = String(process.env.EVICT_OLDEST || '').toLowerCase() === '1';
+  const preferredVictimRaw = process.env.EVICT_BY || null;
+
+  // Chuẩn hoá tên để so khớp
+  const uiIndex = new Map(); // norm -> original
+  const top5Norm = top5.map(n => {
+    const norm = normalizeName(n);
+    if (!uiIndex.has(norm)) uiIndex.set(norm, n);
+    return norm;
+  });
+  const dbMapNorm = new Map();
+  for (const [name, date] of dbMap.entries()) {
+    const norm = normalizeName(name);
+    if (!dbMapNorm.has(norm)) dbMapNorm.set(norm, date);
+  }
+  const preferredVictim = preferredVictimRaw ? normalizeName(preferredVictimRaw) : null;
+
+  const victimNorm = pickEvictionCandidate(top5Norm, dbMapNorm,
+    { graceDays, forceOldest, preferredVictim });
+  const victim = victimNorm ? (uiIndex.get(victimNorm) || victimNorm) : null;
+
+  if (!victim) {
+    console.log('❌ Không tìm được hồ sơ hợp lệ để xoá (không hết hạn/không lạ).');
+    console.log('ℹ️ Dùng --grace=7 hoặc --evict-oldest, hoặc --evict-by="Tên".');
+    return false;
+  }
+
+  console.log('🗑️ Xoá hồ sơ:', victim);
+
+  let res = await openProfileAndGetId(page, victim, 5);
+  if (!res) { console.log('❌ Không mở được hồ sơ cần xoá.'); return false; }
+
+  // Bọc xoá để tránh dừng sớm khi điều hướng nội bộ
+  let okDel = false;
+  try {
+    okDel = await deleteProfileBySettingsId(page, res.id, HARDCODED_PASSWORD, res.settingsUrl, victim);
+  } catch (e) {
+    if (isBenignNavError(e)) {
+      console.warn('⚠️ Benign nav trong lúc xoá, tiếp tục kiểm tra trạng thái…');
+      okDel = true;
+    } else {
+      throw e;
+    }
+  }
+  if (!okDel) { console.log('❌ Xoá thất bại.'); return false; }
+  console.log('✅ Đã xoá hồ sơ:', victim);
+
+  // Tạo + đặt PIN
+  console.log('➕ Tạo hồ sơ mới sau khi xoá…');
+  const addRes = await addProfile(page, wantedName, { isKids });
+  if (!addRes?.ok) { console.log('❌ Tạo hồ sơ mới thất bại.'); return false; }
+  console.log('✅ Đã tạo hồ sơ mới:', wantedName);
+
+  const newId = addRes.settingsId || (await (async () => {
+    const opened = await openProfileAndGetId(page, wantedName, 5);
+    return opened?.id || null;
+  })());
+
+  if (!newId) {
+    console.log('⚠️ Không lấy được settingsId để đặt PIN, nhưng hồ sơ đã tạo xong.');
+    return true;
+  }
+
+  console.log('🔐 Đặt PIN cho hồ sơ mới…');
+  const okPin = await setPinSmart(page, newId, HARDCODED_PASSWORD, pin4, page.url());
+  if (!okPin) { console.log('⚠️ Không đặt được PIN, nhưng hồ sơ đã tạo.'); return false; }
+  console.log('✅ Đã đặt PIN thành công.');
+  return true;
+}
 
 /* ============== MAIN ============== */
 (async () => {
@@ -1842,6 +2076,46 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
 
     // ==== ACTION: add (tạo hồ sơ mới) ====
     // Cú pháp: node loginByCookie.js add "Tên hồ sơ" [PIN4] [kids]
+    {
+  const actionAuto = (process.argv[2] || '').trim().toLowerCase();
+  if (actionAuto === 'auto') {
+    __AUTO_FLOW = true; // đánh dấu auto để outer catch không thoát sớm
+
+    const args = process.argv.slice(3);
+    let newName = '';
+    let pin4 = '';
+    let isKids = false;
+
+    // Bóc tách tham số không phụ thuộc thứ tự
+    for (const a of args) {
+      if (/^--?kids$/i.test(a) || /^kids$/i.test(a)) { isKids = true; continue; }
+      if (/^\d{4}$/.test(a)) { pin4 = a; continue; }
+      if (/^--/.test(a)) continue; // flags xử lý vòng sau
+      if (!newName) newName = a;   // đối số text đầu tiên => name
+    }
+
+    // Flags: --grace=7, --evict-oldest, --evict-by="Tên"
+    for (const a of args) {
+      const mGrace = a.match(/^--grace=(\d{1,3})$/i);
+      if (mGrace) process.env.GRACE_DAYS = mGrace[1];
+      if (/^--evict-oldest$/i.test(a)) process.env.EVICT_OLDEST = '1';
+      const mBy = a.match(/^--evict-by=(.+)$/i);
+      if (mBy) process.env.EVICT_BY = mBy[1].replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
+    }
+
+    if (!newName || !/^\d{4}$/.test(pin4)) {
+      console.log('❌ Thiếu tham số. Dùng:');
+      console.log('   node loginByCookie.js auto "Tên hồ sơ" 0000 [--kids] [--grace=7] [--evict-oldest] [--evict-by="Tên"]');
+      await holdOrExit(1);
+      return;
+    }
+
+    const ok = await autoProvisionProfile(page, newName, pin4, { isKids });
+    console.log(ok ? '✅ AUTO DONE' : '❌ AUTO FAIL');
+    await holdOrExit(ok ? 0 : 1);
+    return; // QUAN TRỌNG: return sớm, không rơi vào logic xử lý arg bên dưới
+  }
+}
     const action0 = (process.argv[2] || '').trim().toLowerCase();
     if (action0 === 'add') {
       const newName  = process.argv[3] || '';
@@ -1934,6 +2208,44 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
       await holdOrExit(okPin ? 0 : 1);
       return;
     }
+    {
+  const actionAuto = (process.argv[2] || '').trim().toLowerCase();
+  if (actionAuto === 'auto') {
+    __AUTO_FLOW = true; // đánh dấu auto để không thoát sớm trong outer catch
+
+    const args = process.argv.slice(3);
+    let newName = '';
+    let pin4 = '';
+    let isKids = false;
+
+    for (const a of args) {
+      if (/^--?kids$/i.test(a) || /^kids$/i.test(a)) { isKids = true; continue; }
+      if (/^\d{4}$/.test(a)) { pin4 = a; continue; }
+      if (/^--/.test(a)) continue; // flags xử dưới
+      if (!newName) newName = a;   // đối số text đầu tiên coi là name
+    }
+
+    for (const a of args) {
+      const mGrace = a.match(/^--grace=(\d{1,3})$/i);
+      if (mGrace) process.env.GRACE_DAYS = mGrace[1];
+      if (/^--evict-oldest$/i.test(a)) process.env.EVICT_OLDEST = '1';
+      const mBy = a.match(/^--evict-by=(.+)$/i);
+      if (mBy) process.env.EVICT_BY = mBy[1].replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
+    }
+
+    if (!newName || !/^\d{4}$/.test(pin4)) {
+      console.log('❌ Thiếu tham số. Dùng:');
+      console.log('   node loginByCookie.js auto "Tên hồ sơ" 0000 [--kids] [--grace=7] [--evict-oldest] [--evict-by="Tên"]');
+      await holdOrExit(1);
+      return;
+    }
+
+    const ok = await autoProvisionProfile(page, newName, pin4, { isKids });
+    console.log(ok ? '✅ AUTO DONE' : '❌ AUTO FAIL');
+    await holdOrExit(ok ? 0 : 1);
+    return;
+  }
+}
 
     // Không truyền gì → chỉ mở trang khóa hồ sơ
     await hardGotoLock(page, settingsId, refererUrl);
@@ -1941,25 +2253,25 @@ async function setPinSmart(page, settingsId, password, newPin, refererUrl) {
     await holdOrExit(0);
     return;
 
-  } catch (err) {
-    if (isBenignNavError(err)) {
-      try {
-        const href = page?.url?.() || '';
-        if (/\/account\/profiles\b/i.test(href)) {
-          const okParam = /[?&]profileDeleted=success\b/i.test(href);
-          if (okParam) {
-            console.log('✅ Xóa hồ sơ thành công (đã về profiles?profileDeleted=success).');
-            await holdOrExit(0);
-            return;
-          }
-        }
-      } catch {}
-
-      console.warn('⚠️ Bỏ qua lỗi do điều hướng:', err.message);
-      await holdOrExit(0);
-      return;
+} catch (err) {
+  if (isBenignNavError(err)) {
+    if (__AUTO_FLOW) {
+      console.warn('⚠️ Bỏ qua lỗi do điều hướng (AUTO), tiếp tục flow…', err?.message || err);
+      return; // không exit – để autoProvisionProfile tiếp tục
     }
-    console.error('❌ Lỗi ngoài ý muốn:', err);
-    await cleanup(1);
+    try {
+      const href = page?.url?.() || '';
+      if (/\/account\/profiles\b/i.test(href) && /[?&]profileDeleted=success\b/i.test(href)) {
+        console.log('✅ Xóa hồ sơ thành công (đã về profiles?profileDeleted=success).');
+        await holdOrExit(0);
+        return;
+      }
+    } catch {}
+    console.warn('⚠️ Bỏ qua lỗi do điều hướng:', err?.message || err);
+    await holdOrExit(0);
+    return;
   }
+  console.error('❌ Lỗi ngoài ý muốn:', err);
+  await cleanup(1);
+}
 })();
