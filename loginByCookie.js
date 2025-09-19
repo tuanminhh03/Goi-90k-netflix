@@ -19,6 +19,26 @@ const NETFLIX_EMAIL    = process.env.NETFLIX_EMAIL || '';     // dùng khi cooki
 const NETFLIX_PASSWORD = process.env.NETFLIX_PASSWORD || '';  // dùng khi cookie hỏng
 const HOLD = process.argv.includes('--hold');
 
+const BASE_HTTP_HEADERS = {
+  'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+};
+let __currentExtraHTTPHeaders = { ...BASE_HTTP_HEADERS };
+
+async function applyExtraHTTPHeaders(page, headers = __currentExtraHTTPHeaders) {
+  __currentExtraHTTPHeaders = { ...headers };
+  await page.setExtraHTTPHeaders(__currentExtraHTTPHeaders);
+}
+
+async function withExtraHTTPHeaders(page, headers = {}, fn) {
+  const previous = { ...__currentExtraHTTPHeaders };
+  await applyExtraHTTPHeaders(page, { ...previous, ...headers });
+  try {
+    return await fn();
+  } finally {
+    await applyExtraHTTPHeaders(page, previous);
+  }
+}
+
 /* ====== Graceful shutdown ====== */
 let browser; // để cleanup dùng được
 let page;
@@ -1055,38 +1075,41 @@ async function robustClickHandle(page, handle) {
 // ==== Điều hướng cứng vào /settings/<ID> (không phải lock) ====
 async function hardGotoSettings(page, settingsId, refererUrl) {
   const settingsUrl = `https://www.netflix.com/settings/${settingsId}`;
-  await page.setExtraHTTPHeaders({
-    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-    ...(refererUrl ? { Referer: refererUrl } : {}),
+  const refererHeaders = refererUrl ? { Referer: refererUrl } : {};
+
+  return await withExtraHTTPHeaders(page, refererHeaders, async () => {
+    const tryOnce = async (how) => {
+      if (how === 'goto')
+        await page.goto(settingsUrl, {
+          waitUntil: 'networkidle2',
+          timeout: 60000,
+          ...(refererUrl ? { referer: refererUrl } : {}),
+        }).catch(()=>{});
+      else if (how === 'href')
+        await page.evaluate((u)=>{ location.href = u; }, settingsUrl).catch(()=>{});
+      else if (how === 'assign')
+        await page.evaluate((u)=>{ window.location.assign(u); }, settingsUrl).catch(()=>{});
+
+      await raceAny(
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
+        page.waitForFunction(
+          (id)=> new RegExp(`/settings/${id}($|[/?#])`).test(location.pathname),
+          { timeout: 8000 }, settingsId
+        )
+      );
+
+      if (await isErrorPage(page)) {
+        console.log('⚠️ Trang lỗi khi vào settings → reload…');
+        await page.goto(page.url(), { waitUntil: 'networkidle2', timeout: 60000 }).catch(()=>{});
+      }
+      return new RegExp(`/settings/${settingsId}($|[/?#])`).test(page.url());
+    };
+
+    if (await tryOnce('goto'))   return true;
+    if (await tryOnce('href'))   return true;
+    if (await tryOnce('assign')) return true;
+    return false;
   });
-
-  const tryOnce = async (how) => {
-    if (how === 'goto')
-      await page.goto(settingsUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(()=>{});
-    else if (how === 'href')
-      await page.evaluate((u)=>{ location.href = u; }, settingsUrl).catch(()=>{});
-    else if (how === 'assign')
-      await page.evaluate((u)=>{ window.location.assign(u); }, settingsUrl).catch(()=>{});
-
-    await raceAny(
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
-      page.waitForFunction(
-        (id)=> new RegExp(`/settings/${id}($|[/?#])`).test(location.pathname),
-        { timeout: 8000 }, settingsId
-      )
-    );
-
-    if (await isErrorPage(page)) {
-      console.log('⚠️ Trang lỗi khi vào settings → reload…');
-      await page.goto(page.url(), { waitUntil: 'networkidle2', timeout: 60000 }).catch(()=>{});
-    }
-    return new RegExp(`/settings/${settingsId}($|[/?#])`).test(page.url());
-  };
-
-  if (await tryOnce('goto'))   return true;
-  if (await tryOnce('href'))   return true;
-  if (await tryOnce('assign')) return true;
-  return false;
 }
 
 // ==== Tìm nút "Xóa hồ sơ" trên mọi frame ====
@@ -1468,46 +1491,49 @@ async function deleteProfileSmart(page, profileOrId, password, refererUrl) {
 /* ============== Điều hướng cứng vào /settings/lock/<ID> ============== */
 async function hardGotoLock(page, settingsId, refererUrl) {
   const lockUrl = `https://www.netflix.com/settings/lock/${settingsId}`;
-  await page.setExtraHTTPHeaders({
-    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-    ...(refererUrl ? { Referer: refererUrl } : {}),
+  const refererHeaders = refererUrl ? { Referer: refererUrl } : {};
+  return await withExtraHTTPHeaders(page, refererHeaders, async () => {
+    const tryOnce = async (how) => {
+      if (how === 'goto')
+        await page.goto(lockUrl, {
+          waitUntil: 'networkidle2',
+          timeout: 60000,
+          ...(refererUrl ? { referer: refererUrl } : {}),
+        }).catch(() => {});
+      else if (how === 'href')
+        await page.evaluate((u) => { location.href = u; }, lockUrl).catch(() => {});
+      else if (how === 'assign')
+        await page.evaluate((u) => { window.location.assign(u); }, lockUrl).catch(() => {});
+
+      await raceAny(
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
+        page.waitForFunction(
+          (id) => location.pathname.includes(`/settings/lock/${id}`) || /\/settings\//.test(location.pathname),
+          { timeout: 8000 }, settingsId
+        )
+      );
+
+      if (await isErrorPage(page)) {
+        console.log('⚠️ Trang lỗi sau khi vào lock → reload…');
+        await page.goto(page.url(), { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+      }
+      if (new RegExp(`/settings/${settingsId}($|[/?#])`).test(page.url()) &&
+          !new RegExp(`/settings/lock/${settingsId}($|[/?#])`).test(page.url())) {
+        await page.evaluate((id) => {
+          if (location.pathname.includes(`/settings/${id}`)) location.href = `/settings/lock/${id}`;
+        }, settingsId).catch(() => {});
+        await page.waitForFunction(
+          (id) => location.pathname.includes(`/settings/lock/${id}`),
+          { timeout: 10000 }, settingsId
+        ).catch(() => {});
+      }
+      return new RegExp(`/settings/lock/${settingsId}($|[/?#])`).test(page.url());
+    };
+    if (await tryOnce('goto'))   return true;
+    if (await tryOnce('href'))   return true;
+    if (await tryOnce('assign')) return true;
+    return false;
   });
-  const tryOnce = async (how) => {
-    if (how === 'goto')
-      await page.goto(lockUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
-    else if (how === 'href')
-      await page.evaluate((u) => { location.href = u; }, lockUrl).catch(() => {});
-    else if (how === 'assign')
-      await page.evaluate((u) => { window.location.assign(u); }, lockUrl).catch(() => {});
-
-    await raceAny(
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 }),
-      page.waitForFunction(
-        (id) => location.pathname.includes(`/settings/lock/${id}`) || /\/settings\//.test(location.pathname),
-        { timeout: 8000 }, settingsId
-      )
-    );
-
-    if (await isErrorPage(page)) {
-      console.log('⚠️ Trang lỗi sau khi vào lock → reload…');
-      await page.goto(page.url(), { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
-    }
-    if (new RegExp(`/settings/${settingsId}($|[/?#])`).test(page.url()) &&
-        !new RegExp(`/settings/lock/${settingsId}($|[/?#])`).test(page.url())) {
-      await page.evaluate((id) => {
-        if (location.pathname.includes(`/settings/${id}`)) location.href = `/settings/lock/${id}`;
-      }, settingsId).catch(() => {});
-      await page.waitForFunction(
-        (id) => location.pathname.includes(`/settings/lock/${id}`),
-        { timeout: 10000 }, settingsId
-      ).catch(() => {});
-    }
-    return new RegExp(`/settings/lock/${settingsId}($|[/?#])`).test(page.url());
-  };
-  if (await tryOnce('goto'))   return true;
-  if (await tryOnce('href'))   return true;
-  if (await tryOnce('assign')) return true;
-  return false;
 }
 
 /* ============== Flow: tới pinentry (Create -> Confirm -> pass) ============== */
@@ -2051,7 +2077,7 @@ async function autoProvisionProfile(page, wantedName, pin4, { isKids = false } =
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     );
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7' });
+    await applyExtraHTTPHeaders(page, BASE_HTTP_HEADERS);
 
     // Cookie login (nếu có)
     await page.goto('https://www.netflix.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
